@@ -14,6 +14,7 @@
 
 import threading
 import sys
+from collections import defaultdict
 
 
 def __get_nil():
@@ -22,6 +23,12 @@ def __get_nil():
       return "NIL"
 
     __repr__ = __str__
+
+    def __bool__(self):
+      return False
+
+    def __len__(self):
+      return 0
 
   return __NIL()
 
@@ -48,10 +55,10 @@ class cached_property(object):
       with self.lock:
         val = obj_dict.get(attr_name, nil_value)
         if val is nil_value:
-          value = func(obj)
-          if value is not nil_value:
-            obj_dict[attr_name] = value
-    return value
+          val = func(obj)
+          if val is not nil_value:
+            obj_dict[attr_name] = val
+    return val
 
   @staticmethod
   def reset(obj, attr, v):
@@ -73,6 +80,8 @@ class cached_property(object):
 class cached_class_property(object):
   v = nil_value
   nil_value = nil_value
+
+  cls_property_tables = defaultdict(dict)
 
   def __init__(self, func):
     self.__doc__ = getattr(func, "__doc__")
@@ -99,7 +108,14 @@ class cached_class_property(object):
 
   @staticmethod
   def delete(cls, attr):
-    delattr(cls, attr)
+    try:
+      delattr(cls, attr)
+      cls_property = cached_class_property.cls_property_tables[cls][attr]
+      cls_property.v = nil_value
+      setattr(cls, attr, cls_property)
+      return True
+    except:
+      return False
 
   @staticmethod
   def pop(cls, attr):
@@ -125,10 +141,12 @@ class cached_class_property(object):
       cls_base = cls_base.__base__
     if v is nil_value:
       with self.lock:
-        if self.v is nil_value:
+        v = self.v
+        if v is nil_value:
           v = func(cls)
           if v is not nil_value:
             setattr(cls_base, func_name, v)
+            self.cls_property_tables[cls_base][func_name] = self
             self.v = v
     else:
       setattr(cls, func_name, v)
@@ -142,6 +160,14 @@ class cached_subclass_property(cached_class_property):
   def __init__(self, func):
     super().__init__(func)
     self.value_tables = {}
+
+  @staticmethod
+  def delete(cls, attr):
+    try:
+      delattr(cls, attr)
+      return True
+    except:
+      return False
 
   def __get__(self, obj, cls):
     func = self.func
@@ -160,6 +186,7 @@ class cached_subclass_property(cached_class_property):
             value_tables[cls] = v
     else:
       setattr(cls, func_name, v)
+    value_tables.pop(cls, None)
     if obj is not None and v.__class__.__name__ == 'function':
       return getattr(obj, func_name)
     return v
