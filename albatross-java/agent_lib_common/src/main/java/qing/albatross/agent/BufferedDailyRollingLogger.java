@@ -213,6 +213,7 @@ public class BufferedDailyRollingLogger {
 
   private void safeCloseFos() {
     if (fos != null) {
+      currentFile = null;
       try {
         fos.close();
       } catch (IOException ignored) {

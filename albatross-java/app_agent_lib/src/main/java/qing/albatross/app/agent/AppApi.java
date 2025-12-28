@@ -42,7 +42,7 @@ public interface AppApi {
 
   boolean finishRedirectAppLog();
 
-  String findClass(String className,boolean applicationLoader);
+  String findClass(String className,boolean applicationLoader,int execMode);
 
   String classLoaders(boolean sync);
 }

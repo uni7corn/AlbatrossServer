@@ -95,7 +95,7 @@ public class AppInjectAgent extends UnixRpcInstance implements AppApi {
     }
     if (args == null) {
       try {
-        Method method = ReflectUtils.findDeclaredMethodWithCount(clz, methodName, numArgs);
+        Member method = ReflectUtils.findDeclaredMethodWithCount(clz, methodName, numArgs);
         return Albatross.methodToString(method);
       } catch (NoSuchMethodException e) {
         return "method not find";
@@ -116,7 +116,7 @@ public class AppInjectAgent extends UnixRpcInstance implements AppApi {
       if (listeners.containsKey(key))
         return ALREADY_HOOK;
       try {
-        Method method = ReflectUtils.findDeclaredMethodWithCount(clz, methodName, numArgs);
+        Member method = ReflectUtils.findDeclaredMethodWithCount(clz, methodName, numArgs);
         AgentInstructionListener listener = new AgentInstructionListener();
         boolean res = Albatross.hookInstruction(method, minDexPc, maxDexPc, listener);
         if (!res)
@@ -174,7 +174,7 @@ public class AppInjectAgent extends UnixRpcInstance implements AppApi {
 
 
   @Override
-  public String findClass(String className, boolean application) {
+  public String findClass(String className, boolean application, int execMode) {
     Class<?> clz;
     if (application) {
       clz = Albatross.findClassFromApplication(className);
@@ -183,6 +183,9 @@ public class AppInjectAgent extends UnixRpcInstance implements AppApi {
     }
     if (clz == null) {
       return null;
+    }
+    if (execMode != ExecutionOption.DO_NOTHING) {
+      Albatross.compileClass(clz, execMode);
     }
     return Objects.requireNonNull(clz.getClassLoader()).toString();
   }
@@ -229,6 +232,7 @@ public class AppInjectAgent extends UnixRpcInstance implements AppApi {
       }
       Albatross.log("AppInjectAgent launch:" + AppMetaInfo.packageName);
     } else {
+      Albatross.setInlineMaxCodeUnits(20);
       Albatross.log("AppInjectAgent attach:" + Albatross.currentPackageName());
     }
     resetExceptionHandler();
@@ -315,6 +319,7 @@ public class AppInjectAgent extends UnixRpcInstance implements AppApi {
     public static Application newApplication$Hook(Instrumentation instrumentation, ClassLoader cl, String className, Context context) {
       if (!isNewApplication) {
         isNewApplication = true;
+        Albatross.setInlineMaxCodeUnits(20);
         appContextCreateInit("launch", context);
         Albatross.log("begin call plugin beforeNewApplication");
         Map<String, AlbatrossPlugin> pluginTable = DynamicPluginManager.getInstance().getPluginCache();
@@ -380,6 +385,7 @@ public class AppInjectAgent extends UnixRpcInstance implements AppApi {
         isNewApplication = true;
         appContextCreateInit("launch", context);
         Albatross.log("begin call plugin beforeNewApplication from class");
+        Albatross.setInlineMaxCodeUnits(20);
         Map<String, AlbatrossPlugin> pluginTable = DynamicPluginManager.getInstance().getPluginCache();
         for (AlbatrossPlugin plugin : pluginTable.values()) {
           try {
@@ -431,6 +437,5 @@ public class AppInjectAgent extends UnixRpcInstance implements AppApi {
       throw new RuntimeException(e);
     }
   }
-
 
 }
