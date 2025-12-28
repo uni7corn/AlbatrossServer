@@ -1,3 +1,7 @@
+version 3.3.0
+- Rpc call improve
+- Optimize the hook for inline methods
+
 version 3.2.0
  - The plugin adds callback methods beforeNewApplication and afterNewApplication
  - Optimize the hook of the method instructions to implement the callbacks of the plugin-related methods before and after the creation of the application
