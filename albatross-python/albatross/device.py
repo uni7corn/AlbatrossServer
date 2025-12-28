@@ -179,6 +179,9 @@ class AlbatrossDevice(object):
       return True
     return False
 
+  def back(self):
+    run_shell(self.shellcmd + 'input keyevent 4')
+
   def screen_size(self, size=None):
     if size is None:
       cmd = self.shellcmd + "wm size"
@@ -190,6 +193,10 @@ class AlbatrossDevice(object):
       cmd = self.shellcmd + "wm size " + size
       lines = run_shell(cmd)[1].decode("utf-8")
       return lines
+
+  @cached_property
+  def screen_width(self):
+    return self.screen_size()[0]
 
   @cached_property
   def swipe_direction(self):
@@ -319,9 +326,14 @@ class AlbatrossDevice(object):
       self.root_shell = self.su_shell
     return shell_root
 
+  def getprop(self, prop):
+    return self.shell(f'getprop {prop}')
+
   @cached_property
   def debuggable(self):
     return self.shell('getprop ro.debuggable') == '1'
+
+  app_agent_updated = False
 
   @cached_property
   def agent_dex(self):
@@ -329,6 +341,7 @@ class AlbatrossDevice(object):
     dst = plugin_dir + Configuration.app_agent_name
     res = self.push_file(Configuration.app_agent_file, dst, mode='444', check=True)
     if res:
+      self.app_agent_updated = True
       self.create_dex_oat_dir(dst)
     return dst
 
@@ -394,15 +407,14 @@ class AlbatrossDevice(object):
 
   def pidofs(self, cmd_line):
     pids = []
-    grep_cmd = f'grep "{cmd_line}"'
-    ret: str = self.shell('ps -ef |' + grep_cmd)
+    ret_code, ret = run_shell(self.shellcmd + f'\'ps -ef | grep "{cmd_line}"\'')
     if ret:
-      grep_exclude = 'grep ' + cmd_line
+      ret = ret.decode()
       lines = ret.split('\n')
       for line in lines:
-        if grep_cmd in line:
+        if not line:
           continue
-        if grep_exclude in line:
+        if 'grep ' in line:
           continue
         pids.append(line.split(maxsplit=2)[1])
     return pids
@@ -538,7 +550,7 @@ class AlbatrossDevice(object):
   def system_server_subscriber(self) -> SystemServerClient:
     port = self.get_forward_port(self.system_server_address)
     subscribe_client = SystemServerClient(port, '127.0.0.1', 'system-' + self.device_id)
-    subscribe_client.set_on_close_listener(self.on_system_subscribe_close)
+    subscribe_client.add_close_listener(self.on_system_subscribe_close, 'system_subscribe')
     subscribe_client.register_broadcast_handler(subscribe_client.launch_process, self.on_launch_process)
     subscribe_client.subscribe()
     return subscribe_client
@@ -580,9 +592,9 @@ class AlbatrossDevice(object):
       port = self.get_forward_port(system_server_address)
       system_server = system_client_class(port, '127.0.0.1', 'system-' + self.device_id)
       system_server.init()
-      system_server.set_on_close_listener(self.on_system_client_close)
+      system_server.add_close_listener(self.on_system_client_close, 'system_disconnect')
       subscribe_client = system_client_class(port, '127.0.0.1', 'system-' + self.device_id)
-      subscribe_client.set_on_close_listener(self.on_system_subscribe_close)
+      subscribe_client.add_close_listener(self.on_system_subscribe_close, 'system_subscribe_close')
       subscribe_client.register_broadcast_handler(subscribe_client.launch_process, self.on_launch_process)
       subscribe_client.subscribe()
       system_server.set_intercept_app(None)
@@ -593,7 +605,7 @@ class AlbatrossDevice(object):
   @cached_property
   def client(self):
     client = self.get_client()
-    client.set_on_close_listener(self.__on_close)
+    client.add_close_listener(self.__on_close, 'albatross server api')
     return client
 
   def clear_plugins(self):
@@ -871,6 +883,23 @@ class AlbatrossDevice(object):
             success.append(pid)
     return success
 
+  def forward_tcp(self, local_port, device_port=None):
+    if device_port is None:
+      device_port = local_port
+    ret_code, _ = self.adb_cmd("forward", "tcp:%d" % local_port, "tcp:%d" % device_port)
+    return ret_code
+
+  def remote_ports(self, remote_port):
+    device_name = self.device_id
+    port_list = []
+    if type(remote_port) == int:
+      remote_port = 'tcp:' + str(remote_port)
+    for s, lp, rp in self.forward_list():
+      if rp == remote_port and s == device_name:
+        local_port = int(lp[4:])
+        port_list.append(local_port)
+    return port_list
+
   def get_forward_port(self, remote_port, not_check=True):
     if isinstance(remote_port, int):
       remote_port = 'tcp:' + str(remote_port)
@@ -999,6 +1028,20 @@ class AlbatrossDevice(object):
   def is_app_install(self, pkg):
     return pkg in self.get_user_packages(include_disabled=True)
 
+  def install_if_not_exist(self, package, apk, version_code=None):
+    try:
+      package_info = self.get_package_info(package)
+    except:
+      package_info = self.get_package_info(package)
+    if package_info:
+      if not version_code:
+        return True
+      current_version = package_info.get('versionCode')
+      if current_version == str(version_code):
+        return True
+    self.adb_cmd('install -r -d -t ' + apk)
+    return True
+
   def get_user_packages(self, include_disabled=False):
     if include_disabled:
       pkgs = self.run_as_shell('pm list packages -3')
@@ -1113,6 +1156,24 @@ class AlbatrossDevice(object):
 
   def __repr__(self):
     return "Device: {}".format(self.device_id)
+
+  def get_device_ip(self):
+    ip_pattern = r"\b(?:\d{1,3}\.){3}\d{1,3}\b"
+    for cmd in ['ip addr show wlan0', 'ifconfig wlan0', 'ip addr']:
+      ret_code, bs = run_shell(self.shellcmd + cmd)
+      if ret_code:
+        continue
+      s = bs.decode()
+      ips = re.findall(ip_pattern, s)
+      # 过滤无效 IP（排除 0.0.0.0、127.0.0.1 等非局域网 IP）
+      valid_ips = [
+        ip for ip in ips
+        if not ip.startswith("0.") and '.255' not in ip
+           and not ip.startswith("127.") and 1 <= int(ip.split(".")[0]) <= 223
+      ]
+      if valid_ips:
+        return valid_ips[0]
+    return None
 
   def get_processes_by_uid(self, target_uid: int, save_name=False):
     output = self.shell("ps -A -o USER,UID,PID,NAME")

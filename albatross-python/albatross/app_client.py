@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from enum import IntEnum
+from enum import IntFlag, IntEnum
 
 from albatross.rpc_client import RpcClient, rpc_api, void, broadcast_api
 
@@ -22,6 +22,25 @@ class InsHookResult(IntEnum):
   CLASS_NOT_FIND = -1
   METHOD_NOT_FIND = -2
   HOOK_FAIL = -3
+
+
+class ExecutionOption(IntFlag):
+  JIT_OSR = 1
+  JIT_BASELINE = 2
+  JIT_OPTIMIZED = 4
+
+  DO_NOTHING = 0
+  DECOMPILE = 8
+  INTERPRETER = DECOMPILE
+  DEFAULT_OPTION = 0x10
+
+  RECOMPILE_OSR = JIT_OSR | DECOMPILE
+  RECOMPILE_BASELINE = JIT_BASELINE | DECOMPILE
+  RECOMPILE_OPTIMIZED = JIT_OPTIMIZED | DECOMPILE
+  DISABLE_AOT = 0x20
+  DISABLE_JIT = 0x40
+  AOT = 0x80
+  NATIVE_CODE = AOT | JIT_OPTIMIZED
 
 
 class AppClient(RpcClient):
@@ -89,6 +108,15 @@ class AppClient(RpcClient):
 
   @rpc_api
   def set_logger(self, log_dir: str, log_file_name: str) -> void:
+    pass
+
+  @rpc_api
+  def find_class(self, cls_name: str, application: bool = True,
+      exec_mode: ExecutionOption = ExecutionOption.DO_NOTHING) -> str:
+    pass
+
+  @rpc_api
+  def class_loaders(self, sync: bool) -> str:
     pass
 
   @broadcast_api

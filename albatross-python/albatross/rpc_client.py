@@ -23,6 +23,23 @@ from .rpc_common import *
 from .wrapper import cached_subclass_property
 
 
+class RawDataParser(object):
+  convertor = None
+
+  def __init__(self, result_convert=None):
+    if result_convert:
+      self.convertor = result_convert
+
+  def __call__(self, data, result):
+    convertor = self.convertor
+    if convertor:
+      return convertor(data, result)
+    return data
+
+  def after_send(self, sock, args):
+    pass
+
+
 class AlbRpcMethod(object):
   parser = None
 
@@ -75,6 +92,8 @@ class AlbRpcMethod(object):
     try:
       rpc_send_data(sock, content, method_id, self.rpc_id)
       if parser != void:
+        if isinstance(parser, RawDataParser):
+          parser.after_send(sock, args)
         idx, result, data = rpc_receive_data(sock)
         while idx < method_id:
           idx, result, data = rpc_receive_data(sock)
@@ -120,93 +139,122 @@ class RpcMeta(type):
   def __new__(mcs, cls_name, bases, attrs):
     call_tables = {}
     broadcast_tables = {}
-    for key, attr_value in attrs.items():
-      if callable(attr_value):
-        is_api = hasattr(attr_value, '_api')
-        if is_api:
-          annotations = attr_value.__annotations__
-          default_args = attr_value.__defaults__
-          args = []
-          ret_f = None
-          argcount = attr_value.__code__.co_argcount
-          if 'return' in annotations:
-            if argcount != len(annotations):
+    api_lists = [attrs]
+    apis = attrs.get('apis')
+    extend_apis = []
+    for base in bases:
+      if issubclass(base, RpcApi):
+        if apis and base not in apis:
+          continue
+        base.mark_subclass(attrs, api_lists)
+    for api_list in api_lists:
+      for key, attr_value in api_list.items():
+        if callable(attr_value):
+          is_api = hasattr(attr_value, '_api')
+          if is_api:
+            if key in call_tables:
+              continue
+            if api_list is not attrs:
+              extend_apis.append(key)
+            annotations = attr_value.__annotations__
+            default_args = attr_value.__defaults__
+            args = []
+            ret_f = None
+            argcount = attr_value.__code__.co_argcount
+            if 'return' in annotations:
+              if argcount != len(annotations):
+                raise WrongAnnotation(f'api {key} all argument should mark type')
+            elif argcount != len(annotations) + 1:
               raise WrongAnnotation(f'api {key} all argument should mark type')
-          elif argcount != len(annotations) + 1:
-            raise WrongAnnotation(f'api {key} all argument should mark type')
-          for name, arg_type in annotations.items():
-            arg_type_str = str(arg_type)
-            if 'str | None' == arg_type_str:
-              arg_type = str
-            if name == 'return':
-              ret_f = attrs.get('parse_' + key, None)
-              if ret_f is not None:
-                if ret_f.__class__.__name__ == 'function':
-                  ret_f = staticmethod(ret_f)
-              elif issubclass(arg_type, Enum):
+            for name, arg_type in annotations.items():
+              arg_type_str = str(arg_type)
+              if 'str | None' == arg_type_str:
+                arg_type = str
+              if name == 'return':
+                ret_f = attrs.get('parse_' + key, None)
+                raw_parser = None
+                if ret_f:
+                  try:
+                    if issubclass(ret_f, RawDataParser):
+                      raw_parser = ret_f
+                      ret_f = None
+                  except:
+                    pass
+                if ret_f is not None:
+                  if ret_f.__class__.__name__ == 'function':
+                    ret_f = staticmethod(ret_f)
+                else:
+                  if issubclass(arg_type, Enum):
+                    real_type = get_enum_real_type(arg_type)
+                    ret_f = EnumResultParser(arg_type, return_type_mappings[real_type])
+                  elif arg_type in return_type_mappings:
+                    ret_f = return_type_mappings[arg_type]
+                  elif hasattr(arg_type, 'parse_value'):
+                    ret_f = getattr(arg_type, 'parse_value')
+                    if ret_f.__class__.__name__ == 'function':
+                      ret_f = staticmethod(ret_f)
+                  if raw_parser is not None:
+                    ret_f = raw_parser(ret_f)
+                break
+              if issubclass(arg_type, Enum):
+                arg_type = get_enum_real_type(arg_type)
+              args.append(arg_convert_tables[arg_type])
+            f = create_call_function(args, default_args)
+            f.__name__ = attr_value.__name__
+            call_tables[key] = (f, ret_f)
+          elif hasattr(attr_value, '_broadcast'):
+            if key in broadcast_tables:
+              continue
+            annotations = attr_value.__annotations__
+            args = []
+            ret_f = None
+            argcount = attr_value.__code__.co_argcount
+            if 'return' in annotations:
+              if argcount != len(annotations):
+                raise WrongAnnotation(f'api {key} all argument should mark type')
+            elif argcount != len(annotations) + 1:
+              raise WrongAnnotation(f'function {key} all argument should mark type')
+            for name, arg_type in annotations.items():
+              arg_type_str = str(arg_type)
+              if 'str | None' == arg_type_str:
+                arg_type = str
+              if name == 'return':
+                if arg_type in return_convert_mappings:
+                  ret_f = return_convert_mappings[arg_type]
+                elif issubclass(arg_type, Enum):
+                  base_type = get_enum_real_type(arg_type)
+                  ret_f = return_convert_mappings[base_type]
+                elif hasattr(arg_type, 'covert_value'):
+                  ret_f = getattr(arg_type, 'covert_value')
+                  if ret_f.__class__.__name__ == 'function':
+                    ret_f = staticmethod(ret_f)
+                break
+              if issubclass(arg_type, Enum):
                 real_type = get_enum_real_type(arg_type)
-                ret_f = EnumResultParser(arg_type, return_type_mappings[real_type])
-              elif arg_type in return_type_mappings:
-                ret_f = return_type_mappings[arg_type]
-              elif hasattr(arg_type, 'parse_value'):
-                ret_f = getattr(arg_type, 'parse_value')
-                if ret_f.__class__.__name__ == 'function':
-                  ret_f = staticmethod(ret_f)
-              break
-            if issubclass(arg_type, Enum):
-              arg_type = get_enum_real_type(arg_type)
-            args.append(arg_convert_tables[arg_type])
-          f = create_call_function(args, default_args)
-          f.__name__ = attr_value.__name__
-          call_tables[key] = (f, ret_f)
-        elif hasattr(attr_value, '_broadcast'):
-          annotations = attr_value.__annotations__
-          args = []
-          ret_f = None
-          argcount = attr_value.__code__.co_argcount
-          if 'return' in annotations:
-            if argcount != len(annotations):
-              raise WrongAnnotation(f'api {key} all argument should mark type')
-          elif argcount != len(annotations) + 1:
-            raise WrongAnnotation(f'function {key} all argument should mark type')
-          for name, arg_type in annotations.items():
-            arg_type_str = str(arg_type)
-            if 'str | None' == arg_type_str:
-              arg_type = str
-            if name == 'return':
-              if arg_type in return_convert_mappings:
-                ret_f = return_convert_mappings[arg_type]
-              elif issubclass(arg_type, Enum):
-                base_type = get_enum_real_type(arg_type)
-                ret_f = return_convert_mappings[base_type]
-              elif hasattr(arg_type, 'covert_value'):
-                ret_f = getattr(arg_type, 'covert_value')
-                if ret_f.__class__.__name__ == 'function':
-                  ret_f = staticmethod(ret_f)
-              break
-            if issubclass(arg_type, Enum):
-              real_type = get_enum_real_type(arg_type)
-              reader = EnumResultReader(arg_type, arg_read_tables[real_type])
-              args.append(reader)
-            else:
-              args.append(arg_read_tables[arg_type])
-          f = create_receive_function(args)
-          f.__name__ = attr_value.__name__
-          broadcast_tables[key] = (f, ret_f)
+                reader = EnumResultReader(arg_type, arg_read_tables[real_type])
+                args.append(reader)
+              else:
+                args.append(arg_read_tables[arg_type])
+            f = create_receive_function(args)
+            f.__name__ = attr_value.__name__
+            broadcast_tables[key] = (f, ret_f, attr_value)
 
     for key, (f, ret_f) in call_tables.items():
-      ori_f = attrs.pop(key)
+      ori_f = attrs.pop(key, None)
       attrs['call_' + key] = f
       if ret_f is not None:
         attrs['parse_' + key] = ret_f
-    for key, (f, ret_f) in broadcast_tables.items():
-      ori_f = attrs.pop(key)
+    for key, (f, ret_f, ori_f) in broadcast_tables.items():
+      ori_f = attrs.pop(key, ori_f)
       attrs['receive_' + key] = f
       if ret_f:
         attrs['result_' + key] = ret_f
       attrs['handle_' + key] = ori_f
       attrs['origin_' + key] = ori_f
       attrs[key] = key
+    if extend_apis:
+      for api_name in extend_apis:
+        attrs[api_name] = api_getter(api_name)
     ncls = super().__new__(mcs, cls_name, bases, attrs)
     return ncls
 
@@ -409,7 +457,7 @@ class RpcClient(metaclass=RpcMeta):
   prohibit_request = False
   can_send = True
   send_count = 0
-  on_close_callback = None
+  on_close_callbacks: dict
   quiet = False
 
   def __init__(self, port, host=None, name=None, timeout=None):
@@ -425,12 +473,13 @@ class RpcClient(metaclass=RpcMeta):
       name = self.__class__.__name__.lower() + '-{}'.format(port)
     self.name = name
     self.request_lock = threading.Lock()
+    self.on_close_callbacks = {}
 
   def forbid_call(self):
     self.allow_apis = {}
 
-  def set_on_close_listener(self, listener):
-    self.on_close_callback = listener
+  def add_close_listener(self, listener, key='default'):
+    self.on_close_callbacks[key] = listener
 
   def on_close(self, is_close: bool, sock):
     self.forbid_call()
@@ -503,12 +552,14 @@ class RpcClient(metaclass=RpcMeta):
         sock.close()
       except:
         pass
-      if self.on_close_callback:
-        try:
-          self.on_close_callback(self)
-          self.on_close_callback = None
-        except:
-          traceback.print_exc()
+      callbacks = self.on_close_callbacks
+      if callbacks:
+        for key, callback in callbacks.items():
+          try:
+            callback(self)
+          except:
+            traceback.print_exc()
+        callbacks.clear()
       return True
     return False
 
@@ -544,7 +595,7 @@ class RpcClient(metaclass=RpcMeta):
     return rpc_tables
 
   @rpc_api
-  def subscribe(self):
+  def subscribe(self, params: str = None, flags: int = 0):
     """
     订阅RPC服务，用于接收广播消息
 
@@ -608,7 +659,7 @@ class RpcClient(metaclass=RpcMeta):
         try:
           if broadcast_name:
             arg_parser = getattr(self, 'receive_' + broadcast_name)
-            args = arg_parser(data)
+            args = arg_parser(data, self.sock)
             handler = getattr(self, 'handle_' + broadcast_name)
             result = handler(*args)
             convertor = getattr(self, 'result_' + broadcast_name, None)
@@ -647,13 +698,13 @@ class RpcClient(metaclass=RpcMeta):
     subscriber.close()
     self.subscriber = None
 
-  def create_subscriber(self) -> 'RpcClient':
+  def create_subscriber(self, params: str = None, flags: int = 0) -> 'RpcClient':
     if self.subscriber:
       return self.subscriber
     subscriber = self.__class__(self.port, self.host, self.name + ':subscribe', self.default_timeout)
-    subscriber.subscribe()
+    subscriber.subscribe(params, flags)
     self.subscriber = subscriber
-    subscriber.set_on_close_listener(self._subscriber_close)
+    subscriber.add_close_listener(self._subscriber_close, 'subscriber_watch')
     return subscriber
 
   def parse_subscribe(self, data, result):

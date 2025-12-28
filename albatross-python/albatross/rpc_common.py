@@ -17,6 +17,8 @@ import struct
 from dataclasses import dataclass
 from enum import Enum
 
+from .wrapper import cached_subclass_property
+
 MSG_APIS = 3
 CALL_ID_MASK = 0xffff
 BROADCAST_RESULT_NO_HANDLER = -120
@@ -175,6 +177,13 @@ def read_json(data, idx):
   return s, idx
 
 
+def read_bytes(data, idx):
+  i, = struct.unpack('<i', data[idx:idx + 4])
+  idx += 4
+  bs = data[idx:idx + i]
+  return bs, idx + i
+
+
 def read_int(data, idx):
   i, = struct.unpack('<i', data[idx:idx + 4])
   return i, idx + 4
@@ -216,6 +225,10 @@ def put_long(data):
   return struct.pack('<q', data)
 
 
+def nop(data):
+  return b''
+
+
 def read_short(data, idx):
   return struct.unpack('<h', data[idx:idx + 2]), idx + 2
 
@@ -233,11 +246,12 @@ def put_bool(b: bool):
 
 def put_string(s: str):
   if s:
-    s_len = len(s)
+    bs = s.encode()
+    s_len = len(bs)
     if s_len > 0xffff:
       s_len = 0xffff
     b_len = struct.pack('<H', s_len)
-    return b''.join([b_len, s.encode(), b'\0'])
+    return b''.join([b_len, bs, b'\0'])
   return b'\0\0'
 
 
@@ -282,11 +296,11 @@ def put_bytes(b: bytes):
 
 
 arg_convert_tables = {int: put_int, str: put_string, str | None: put_string, bytes: put_bytes, bool: put_bool,
-                      float: put_float, double: put_double, byte: put_byte, long: put_long}
+                      float: put_float, double: put_double, byte: put_byte, long: put_long, socket.socket: nop}
 
 arg_read_tables = {int: read_int, str: read_string, str | None: read_string, byte: read_byte, bool: read_bool,
                    float: read_float, double: read_double, short: read_short, long: read_long, dict: read_json,
-                   list: read_json}
+                   list: read_json, bytes: read_bytes, socket.socket: socket.socket}
 
 
 class RpcException(Exception):
@@ -340,10 +354,13 @@ def create_call_function(arg_list, default_args):
 
 
 def create_receive_function(arg_list):
-  def __wrapper(client, sock_data: bytes):
+  def __wrapper(client, sock_data: bytes, sock):
     args = []
     idx = 0
     for parser in arg_list:
+      if parser == socket.socket:
+        args.append(sock)
+        continue
       arg, idx = parser(sock_data, idx)
       args.append(arg)
     return args
@@ -422,8 +439,21 @@ return_type_mappings = {bool: staticmethod(parse_bool), int: staticmethod(parse_
 return_convert_mappings = {bool: staticmethod(convert_bool), int: staticmethod(convert_int),
                            str: staticmethod(convert_string), bytes: staticmethod(convert_bytes),
                            dict: staticmethod(convert_json), list: staticmethod(convert_json),
-                           void: None, short: staticmethod(convert_short), byte: staticmethod(convert_byte),
+                           void: None, short: staticmethod(convert_short), byte: staticmethod(convert_byte), None: None,
                            }
+
+
+class api_getter(object):
+
+  def __init__(self, api_name):
+    self.__doc__ = api_name
+    self.api_name = api_name
+
+  def __get__(self, obj, cls):
+    method = self.api_name
+    if obj is None:
+      return self
+    return obj.__getattr__(method)
 
 
 def get_enum_real_type(t):
@@ -435,3 +465,42 @@ def get_enum_real_type(t):
     t = bases[0]
     if not issubclass(t, Enum):
       return t
+
+
+class RpcApi(object):
+  apis: dict
+  broadcasts: dict
+
+  @cached_subclass_property
+  def apis(self):
+    apis = {}
+    broadcasts = {}
+    for key, attr_value in self.__dict__.items():
+      if callable(attr_value):
+        is_api = hasattr(attr_value, '_api')
+        if is_api:
+          apis[key] = attr_value
+        elif hasattr(attr_value, '_broadcast'):
+          broadcasts[key] = attr_value
+    self.broadcasts = broadcasts
+    return apis
+
+  @classmethod
+  def mark_subclass(cls, attrs, api_list: list):
+    apis = cls.apis
+    if apis:
+      for key, v in apis.items():
+        fn = attrs.get(key)
+        if callable(fn):
+          fn._api = True
+      api_list.append(apis)
+    broadcasts = cls.broadcasts
+    if broadcasts:
+      for key, v in broadcasts.items():
+        fn = attrs.get(key)
+        if callable(fn):
+          fn._broadcast = True
+      api_list.append(broadcasts)
+    for p in cls.__bases__:
+      if p != RpcApi and issubclass(p, RpcApi):
+        p.mark_subclass(attrs, api_list)
