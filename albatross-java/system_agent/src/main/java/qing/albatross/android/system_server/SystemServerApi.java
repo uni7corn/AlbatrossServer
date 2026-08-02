@@ -16,6 +16,7 @@
 package qing.albatross.android.system_server;
 
 
+import qing.albatross.exception.AlbatrossErr;
 import qing.albatross.server.Broadcast;
 
 public interface SystemServerApi {
@@ -59,11 +60,20 @@ public interface SystemServerApi {
 
   String getFrontActivityQuick();
 
+  void setAppAndroidId(int uid, String android_id) throws AlbatrossErr;
+
   @Broadcast
   byte launchProcess(int uid, int pid, String pkg, String processName, String data);
 
 
+  @Broadcast
+  void collectData(String data);
+
   int getVersion();
 
   String allowAppPermission(String pkgName, String permissionName, int uid);
+
+  byte clearUid(int uid);
+
+  void stabilityTest(int count);
 }

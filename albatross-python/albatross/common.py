@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import logging
 import os
 from pathlib import Path
 
@@ -23,6 +24,7 @@ OUT_TIME_CODE = 996
 FAULT_CODE = 997
 import random
 import string
+logger = logging.getLogger("albatross")
 
 lib_origin_name = 'libalbatross_base.so'
 SYSTEM_UID = 1000
@@ -157,7 +159,7 @@ class Configuration(object):
       os.makedirs(res, exist_ok=True)
       if os.path.exists(res):
         return res
-      print('config_dir {} is configured but does not exist'.format(res))
+      logger.warning(f'config_dir {res} is configured but does not exist')
     res = str(Path.home()) + "/.albatross/"
     os.makedirs(res, exist_ok=True)
     return res
@@ -168,9 +170,9 @@ class Configuration(object):
     if res:
       if os.path.exists(res):
         return res
-      print('resource_dir {} is configured but does not exist'.format(res))
+      logger.warning(f'resource_dir {res} is configured but does not exist')
     res = os.path.abspath(os.path.dirname(os.path.relpath(__file__)) + '/../../resource') + '/'
-    assert os.path.exists(res)
+    assert os.path.exists(res), res
     return res
 
   @cached_class_property
@@ -205,7 +207,7 @@ class Configuration(object):
     if res:
       if os.path.exists(res):
         return res
-      print('app_agent_file {} is configured but does not exist'.format(res))
+      logger.warning(f'app_agent_file {res} is configured but does not exist')
     return self.agent_dir + "app_agent.dex"
 
   albatross_class_name = __make_get('albatross_class_name', "qing/albatross/core/Albatross")

@@ -13,20 +13,24 @@
 # limitations under the License.
 import json
 import os
+import random
 import re
 import socket
 import subprocess
 import sys
 import tempfile
 import time
+from contextlib import contextmanager
 
-from .albatross_client import AlbatrossClient, DexLoadResult, InjectFlag, AlbatrossInitFlags, RunTimeISA, SetResult
-from .common import Configuration, run_shell, lib_origin_name, generate_random_variable_name, SYSTEM_UID, OUT_TIME_CODE
+from .albatross_client import AlbatrossClient, DexLoadResult, InjectFlag, AlbatrossInitFlags, RunTimeISA, SetResult, \
+  MountResult
+from .common import Configuration, run_shell, lib_origin_name, generate_random_variable_name, SYSTEM_UID, OUT_TIME_CODE, \
+  logger
 from .exceptions import DeviceOffline, NoDeviceFound, DeviceNoFindErr, DeviceNotRoot, PackageNotInstalled, DeviceReboot
 from .plugin import Plugin
 from .rpc_client import byte
 from .system_server_client import SystemServerClient
-from .wrapper import cached_property
+from .wrapper import cached_property, cached_class_property
 
 
 class DeviceBrand:
@@ -35,6 +39,7 @@ class DeviceBrand:
   Aosp = 'Android'
   Google = 'google'
   RedMi = 'Redmi'
+  OPPO = 'OPPO'
 
 
 def check_socket_port(ip, port):
@@ -48,22 +53,33 @@ def check_socket_port(ip, port):
     return False
 
 
-def get_valid_port():
-  import socket
-
-  temp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-  temp_sock.bind(("", 0))
-  port = temp_sock.getsockname()[1]
-  temp_sock.close()
-  return port
-
-
-adb_path = Configuration.adb
+@contextmanager
+def get_available_port():
+  """
+  安全获取一个可用端口，并在 with 块内保持占用
+  退出 with 块后**自动释放**，崩溃也会释放
+  """
+  temp_sock = None
+  try:
+    # 创建 socket
+    temp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    # 端口复用，避免 TIME_WAIT 报错
+    temp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    # 绑定系统分配的空闲端口（会直接占用，别人无法抢）
+    temp_sock.bind(("", 0))
+    # 获取端口号
+    port = temp_sock.getsockname()[1]
+    # 把端口返回给 with 语句使用
+    yield port
+  finally:
+    # 无论是否崩溃、报错、正常退出，都会执行关闭！
+    if temp_sock:
+      temp_sock.close()
 
 
 def get_devices():
   try:
-    _, lines = run_shell(adb_path + " devices", split=True)
+    _, lines = run_shell(AlbatrossDevice.adb + " devices", split=True)
     if "Error" in lines:
       return []
     line_len = len(lines)
@@ -77,7 +93,7 @@ def get_devices():
             if device_status != 'unauthorized':
               devices.append(device[0])
           else:
-            run_shell(adb_path + ' disconnect ' + device[0], timeout=4)
+            run_shell(AlbatrossDevice.adb + ' disconnect ' + device[0], timeout=4)
       return devices
     return []
   except:
@@ -86,7 +102,7 @@ def get_devices():
 
 def get_usb_devices():
   try:
-    _, lines = run_shell(adb_path + " devices", split=True)
+    _, lines = run_shell(AlbatrossDevice.adb + " devices", split=True)
     if "Error" in lines:
       return []
     line_len = len(lines)
@@ -101,7 +117,7 @@ def get_usb_devices():
             if '.' not in device_id and device_status != 'unauthorized':
               devices.append(device_id)
           else:
-            run_shell(f'{adb_path} disconnect {device_id}')
+            run_shell(f'{AlbatrossDevice.adb} disconnect {device_id}')
       return devices
     return []
   except:
@@ -113,7 +129,7 @@ default_connect_timeout = 5
 
 def try_connect(device_name, try_time=2):
   for i in range(try_time):
-    ret_code, bs = run_shell(f"{adb_path} connect {device_name}", timeout=default_connect_timeout)
+    ret_code, bs = run_shell(f"{AlbatrossDevice.adb} connect {device_name}", timeout=default_connect_timeout)
     if ret_code == OUT_TIME_CODE:
       return False
     if b'failed' not in bs:
@@ -128,7 +144,7 @@ def try_connect(device_name, try_time=2):
 
 def disconnect(device_name):
   get_device_manager().devices.pop(device_name, None)
-  run_shell(f"{adb_path} disconnect {device_name}")
+  run_shell(f"{AlbatrossDevice.adb} disconnect {device_name}")
 
 
 default_try_time = 3
@@ -143,11 +159,11 @@ def check_device_alive(device_name, try_time=None):
   else:
     timeout = default_timeout
   for i in range(try_time):
-    ret_code, bs = run_shell(f"{adb_path} -s {device_name} shell echo ping", timeout=timeout)
+    ret_code, bs = run_shell(f"{AlbatrossDevice.adb} -s {device_name} shell echo ping", timeout=timeout)
     if bs and bs.startswith(b'ping'):
       return True
     if '.' in device_name:
-      code, res = run_shell(f"{adb_path} connect {device_name}", timeout=2)
+      code, res = run_shell(f"{AlbatrossDevice.adb} connect {device_name}", timeout=3)
       if b'failed' in res:
         return False
       if b'connected' in res:
@@ -181,7 +197,7 @@ else:
 
 pkg_pattern = re.compile(r"package:([\w.]+)(?:\s+|$)")
 
-resume_activity_pattern = re.compile(r"mResumedActivity: ActivityRecord{\w+\s\w+\s([\w\.]+/[\w\.]+)")
+resume_activity_pattern = re.compile(r"mResumedActivity: ActivityRecord{\w+\s\w+\s([\w\.]+/[\w\.$]+)")
 
 
 class AlbatrossDevice(object):
@@ -200,9 +216,15 @@ class AlbatrossDevice(object):
   reconnect = True
   cached_ip = False
   usb_mode = True
+  load_kpm_impl = None
+
+  @cached_class_property
+  def adb(self):
+    return Configuration.adb
 
   def __init__(self, device_id):
     self.device_id = device_id
+    adb_path = AlbatrossDevice.adb
     self.cmd = adb_path + " -s " + device_id + " "
     shellcmd_list = [adb_path, "-s", device_id, "shell"]
     self.shellcmd = ' '.join(shellcmd_list) + ' '
@@ -221,6 +243,9 @@ class AlbatrossDevice(object):
         if port:
           self.tcp_port = int(port)
 
+  @cached_property
+  def mount_paths(self):
+    return {}
 
   def shell(self, cmd, timeout=None, su_cmd=False) -> list | str:
     start_time = time.time()
@@ -232,6 +257,7 @@ class AlbatrossDevice(object):
         else:
           # command = shell_prefix + "'{} -c \"".format(self.su_file) + cmd + "\"'"
           # command = f"{self.shellcmd} {self.su_file} -c \"{cmd}\""
+          cmd = cmd.replace('"', '\\"')
           command = shell_prefix + [f"{self.su_file} -c \"{cmd}\""]
       else:
         if sys.platform == 'win32' or True:
@@ -251,7 +277,11 @@ class AlbatrossDevice(object):
           if i < 2:
             time.sleep(0.2)
             continue
-          if self.usb_mode and self.connect_ip:
+          if not self.usb_mode:
+            if i < 3:
+              try_connect(self.device_id, try_time=1)
+              continue
+          elif self.connect_ip:
             if '.' not in self.shellcmd:
               if self.switch_to_ip_connect():
                 continue
@@ -263,11 +293,15 @@ class AlbatrossDevice(object):
       end_time = time.time()
       cost = end_time - start_time
       if cost > 10:
-        print(f'device {self.device_id} run {cmd[:32]} cost {cost}s')
+        logger.info(f'device {self.device_id} run {cmd[:32]} cost {cost}s')
       return result
+    raise DeviceOffline(self)
 
   @cached_property
   def serial_no(self):
+    return self.get_serial()
+
+  def get_serial(self):
     device_id = self.device_id
     if '.' not in device_id:
       return device_id
@@ -278,6 +312,21 @@ class AlbatrossDevice(object):
     if self.usb_mode:
       return check_device_alive(self.device_id, try_time)
     return check_device_alive(self.connect_ip, try_time)
+    # for i in range(try_time):
+    #   try:
+    #     ret_code, ret = run_shell(self.shellcmd + 'echo "ping"', timeout=2)
+    #     if b'ping' in ret:
+    #       return True
+    #   except:
+    #     pass
+    #   device_id = self.device_id
+    #   if '.' in device_id:
+    #     run_shell(AlbatrossDevice.adb + ' connect ' + device_id, timeout=2)
+    #     time.sleep(1)
+    # try:
+    #   return 'ping' == self.shell('echo "ping"', timeout=2)
+    # except:
+    #   return False
 
   # ime_server=pkg/class
   def set_ime(self, ime_service, enable=True):
@@ -288,22 +337,26 @@ class AlbatrossDevice(object):
 
   @property
   def is_screen_on(self):
-    ret_str = self.run_as_shell("dumpsys power | grep -E 'mWakefulness=|Display Power'")
-    if 'Error' in ret_str:
-      if "Can't find service" in ret_str:
-        return None
-      return True
-    if 'mWakefulness=' in ret_str:
-      return 'mWakefulness=Awake' in ret_str
-    match = re.search(r"Display Power: state=(\w+)", ret_str)
-    return match.group(1) == 'ON'
+    for i in range(3):
+      ret_str = self.run_as_shell("dumpsys power | grep -E 'mWakefulness=|Display Power'")
+      if 'Error' in ret_str:
+        if "Can't find service" in ret_str:
+          return None
+        return True
+      if 'mWakefulness=' in ret_str:
+        return 'mWakefulness=Awake' in ret_str
+      match = re.search(r"Display Power: state=(\w+)", ret_str)
+      if not match:
+        continue
+      return match.group(1) == 'ON'
+    self.reboot('power service dead')
+    raise DeviceReboot(f'device {self.device_id} power dead')
 
   def wake_up(self):
     ret = self.is_screen_on
     if not ret:
       if ret is None:
-        self.reboot()
-        print('Rebooting for server:' + self.device_id)
+        self.reboot('power service dead')
         return
       self.run_as_shell("input keyevent 26")
     else:
@@ -322,8 +375,26 @@ class AlbatrossDevice(object):
   def back(self):
     run_shell(self.shellcmd + 'input keyevent 4')
 
-  def reboot(self):
+  reboot_callback = None
+
+  def reboot(self, reason=None, wait_time=0):
+    try:
+      time_id = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time()))
+      if reason:
+        logger.info(f'reboot device {self.device_id} by {reason}, wait {wait_time}')
+        self.shell(f"echo '{time_id} {reason} {wait_time}' >> /data/local/tmp/reboot")
+      else:
+        self.shell(f"echo '{time_id} {wait_time}' >> /data/local/tmp/reboot")
+    except:
+      pass
+    if self.reboot_callback:
+      try:
+        self.reboot_callback(self, reason)
+      except:
+        pass
     run_shell(self.cmd + ' reboot')
+    if wait_time > 0:
+      time.sleep(wait_time)
 
   def screen_size(self, size=None):
     if size is None:
@@ -395,7 +466,7 @@ class AlbatrossDevice(object):
     return ret_code
 
   def connect(self):
-    run_shell(adb_path + ' connect ' + self.device_id, timeout=3)
+    run_shell(AlbatrossDevice.adb + ' connect ' + self.device_id, timeout=3)
 
   def is_online(self):
     devices = get_devices()
@@ -430,19 +501,29 @@ class AlbatrossDevice(object):
     on = self.is_selinux_on()
     if on:
       self.setenforce(False)
-    cmd = self.shellcmd + "'{} shell -c \"".format(self.su_file) + cmd + "\"'"
-    ret = run_shell(cmd, timeout=timeout)
-    self.ret_code = ret[0]
-    result = ret[1].decode().strip()
-    if on:
-      self.setenforce(True)
-    return result
+    # cmd = self.shellcmd + "'{} shell -c \"".format(self.su_file) + cmd + "\"'"
+    # ret = run_shell(cmd, timeout=timeout)
+    # self.ret_code = ret[0]
+    # result = ret[1].decode().strip()
+    try:
+      result = self.shell(cmd, timeout)
+      return result
+    finally:
+      if on:
+        try:
+          self.setenforce(True)
+        except:
+          pass
 
   run_as_shell = shell
 
   def is_shell_root(self):
-    is_not_root = "Permission" in self.su_shell("touch /data/local/file_test")
-    ret = "Permission" not in self.su_shell("rm /data/local/file_test")
+    touch_result = self.su_shell("touch /data/local/file_test")
+    if 'inaccessible' in touch_result:
+      return False
+    is_not_root = "Permission" in touch_result
+    remove_result = self.su_shell("rm /data/local/file_test")
+    ret = "Permission" not in remove_result
     return ret
 
   @cached_property
@@ -457,19 +538,22 @@ class AlbatrossDevice(object):
         return i
     return 'su'
 
-  @cached_property
-  def is_root(self):
+  def check_is_root(self):
     adb_root = self.is_adb_root()
     if adb_root:
       self.shell_user = 'root'
       self.root_shell = self.shell
-      if self.brand == 'realme':
+      if self.sdk_version >= 34:
         self.run_as_shell = self.switch_shell_run
       return True
     shell_root = self.is_shell_root()
     if shell_root:
       self.root_shell = self.su_shell
     return shell_root
+
+  @cached_property
+  def is_root(self):
+    return self.check_is_root()
 
   def getprop(self, prop):
     return self.shell(f'getprop {prop}')
@@ -478,6 +562,20 @@ class AlbatrossDevice(object):
   def debuggable(self):
     return self.shell('getprop ro.debuggable') == '1'
 
+  @cached_property
+  def magisk_install_cmd(self):
+    res = self.root_shell('which apd')
+    if res:
+      return 'apd module install'
+    else:
+      res = self.root_shell('which ksud')
+      if res:
+        return 'ksud module install'
+      return 'magisk --install-module'
+
+  def is_vpn_on(self):
+    return 'encap' in self.shell('ifconfig | grep tun0')
+
   app_agent_updated = False
 
   @cached_property
@@ -485,6 +583,29 @@ class AlbatrossDevice(object):
     device_dir = Configuration.config_dir + "device/"
     os.makedirs(device_dir, exist_ok=True)
     return device_dir + f"device_{self.serial_no}_config.json"
+
+  def save_device_data(self, key, value):
+    if 'data' not in self.device_config:
+      self.device_config['data'] = {key: value}
+      self.update_count += 1
+    else:
+      old = self.device_config.get('data', {}).get(key)
+      if old != value:
+        self.device_config['data'][key] = value
+        self.update_count += 1
+
+  def pop_device_data(self, key):
+    if 'data' in self.device_config:
+      data = self.device_config.get('data', {})
+      if key in data:
+        data.pop(key, None)
+        self.update_count += 1
+
+  def reload_data(self):
+    cached_property.delete(self, 'device_config')
+
+  def get_device_data(self, key, def_value=None):
+    return self.device_config.get('data', {}).get(key, def_value)
 
   update_count = 0
 
@@ -508,7 +629,7 @@ class AlbatrossDevice(object):
       app_agent_name = 'framework-' + generate_random_variable_name(min_length=2, max_length=6) + '.jar'
       device_config = {'lib_name': lib_name, 'app_agent_name': app_agent_name,
                        'server_port': 'localabstract:' + generate_random_variable_name(min_length=2,
-                         max_length=8), 'dex_maps': {}}
+                         max_length=8), 'dex_maps': {}, 'data': {}, 'server_port_num': 6000 + random.randint(0, 2000)}
       with open(device_config_path, 'w') as fp:
         json.dump(device_config, fp, ensure_ascii=False, indent=1)
     return device_config
@@ -565,12 +686,12 @@ class AlbatrossDevice(object):
     if self.shell_user == 'shell' and md5_current is not None:
       self.delete_file(dst)
     command = self.cmd + ' push "{}" "{}"'.format(file, dst)
-    ret_code, s = run_shell(command)
+    ret_code, s = run_shell(command, timeout=120)
     res = ret_code == 0
     if res:
       if extra_cmds:
         self.root_shell(';'.join(extra_cmds))
-      print(s)
+      logger.info(s)
       return res
     elif b'pushed' in s:
       new_md5 = self.get_file_md5(dst)
@@ -579,12 +700,12 @@ class AlbatrossDevice(object):
     if self.is_root and self.shell_user == 'shell':
       tmp_path = '/data/local/tmp/' + md5_dst
       command = self.cmd + ' push "{}" "{}"'.format(file, tmp_path)
-      ret_code, s = run_shell(command)
+      ret_code, s = run_shell(command, timeout=120)
       res = ret_code == 0
       if res:
         command = self.root_shell(f'mkdir -p {os.path.dirname(dst)} && mv {tmp_path} {dst}')
         if not command:
-          print(s)
+          logger.info(s)
           if extra_cmds:
             self.root_shell(';'.join(extra_cmds))
           return True
@@ -610,12 +731,19 @@ class AlbatrossDevice(object):
       return [int(i) for i in s.split()]
     return []
 
-  def kill_process(self, process):
+  def kill_process(self, process, reason=None, reboot_count: int = 0):
     pids = self.pidof(process)
     if pids:
+      if reboot_count and len(pids) >= reboot_count:
+        self.reboot(f'{self.device_id} find much process {process}:{pids}')
+        return
       for pid in pids:
         self.kill_pid(pid)
-        print('kill', process, pid)
+      if not reason:
+        logger.info(f'{self.device_id} kill {process} {pids}')
+      else:
+        logger.info(f'{self.device_id} kill {process}:{pids} by {reason}')
+    return pids
 
   def kill_pid(self, pid, sig=9):
     if pid:
@@ -623,7 +751,7 @@ class AlbatrossDevice(object):
 
   def __on_close(self, client):
     cached_property.delete(self, 'client')
-    print('albatross server disconnected')
+    logger.info('albatross server disconnected')
 
   def setenforce(self, on=False):
     if on:
@@ -672,18 +800,28 @@ class AlbatrossDevice(object):
     except:
       return 0
 
+  @cached_property
+  def copy_script(self):
+    file_path = os.path.dirname(__file__) + "/copy_with_selinux.sh"
+    dst = '/data/local/tmp/copy_with_selinux.sh'
+    self.push_file(file_path, dst, mode=700, owner='root')
+    return dst
+
   def get_battery_level(self):
     result = self.shell('dumpsys battery | grep level')
     return int(result.split(':')[1])
 
-  def kill_client(self):
-    self.kill_process(os.path.basename(Configuration.server_dst_path))
+  def kill_client(self, reason=None):
+    self.kill_process(os.path.basename(Configuration.server_dst_path), reason)
+
+  albatross_client_impl = AlbatrossClient
+  enable_kpm = True
 
   def get_client(self) -> AlbatrossClient:
     if not self.is_root:
       raise DeviceNotRoot(self)
-    server_dst_path = Configuration.server_dst_path
-    server_dst_path = '/data/local/tmp/' + server_dst_path
+    server_dst_basename = Configuration.server_dst_path
+    server_dst_path = '/data/local/tmp/' + server_dst_basename
     server_port = Configuration.server_port
     if server_port == 'random':
       # res = re.findall(r'albatross_server (\w+)', self.shell('ps -ef | grep albatross_server'))
@@ -691,10 +829,28 @@ class AlbatrossDevice(object):
       #   server_port = 'localabstract:' + res[0]
       # else:
       server_port = self.device_config.get('server_port', 'localabstract:albatross_manager')
-    local_port = self.get_forward_port(server_port)
+    if self.usb_mode or not os.environ.get('ALBATROSS_SOCKET_CONNECT'):
+      local_port = self.get_forward_port(server_port)
+      host = '127.0.0.1'
+    else:
+      host = self.connect_ip
+      try:
+        server_port = int(server_port)
+      except:
+        pids = self.root_shell('ps -ef | grep ' + server_port.split(':')[-1])
+        if pids and server_dst_basename in pids:
+          pids = pids.splitlines()
+          for pid in pids:
+            if server_dst_basename not in pid:
+              continue
+            pid = pid.split()[1]
+            self.kill_pid(pid)
+            logger.info(f'kill {self.device_id} old client {server_port}')
+        server_port = self.device_config.get('server_port_num', 7000)
+      local_port = server_port
     device_abi = self.cpu_abi
     server_file, abi_lib, abi_lib32 = Configuration.get_server_path(device_abi)
-    assert os.path.exists(server_file)
+    assert os.path.exists(server_file), server_file
     update = self.push_file(server_file, server_dst_path, check=True, mode='500', owner='root')
     lib_dir = Configuration.lib_path + self.abi_lib_name + '/'
     server_lib_dst = lib_dir + lib_origin_name
@@ -717,17 +873,224 @@ class AlbatrossDevice(object):
         lib_dst_32 = self.lib32_dir + lib_name
         self.push_file(lib_src_32, lib_dst_32, mode='644', file_type=self.file_type)
         self.lib32_dst = lib_dst_32
+
+    def sync_lib():
+      if self.anti_detection:
+        if not self.enable_kpm:
+          kpm = False
+        else:
+          kpm = client.support_extend_kpm()
+          if not kpm and self.load_kpm_impl:
+            try:
+              self.load_kpm_impl(self, client)
+              kpm = client.support_extend_kpm()
+            except:
+              pass
+        if self.sdk_version >= 29 and not kpm:
+          owner = 'root'
+          lib_file_type = 'system_lib_file'
+          jar_file_type = 'system_file'
+          ori_file_md5 = self.get_file_md5(app_lib_dst)
+          mount_path_dirs = ['/system_ext/', '/system/product/', '/vendor/']
+          mount_path_dir = None
+          libs = []
+          for m_dir in mount_path_dirs:
+            ret_code, ret_str = run_shell(self.shellcmd + 'ls -al ' + m_dir)
+            if ret_code == 0:
+              exists = []
+              for i in ['lib64', 'lib']:
+                ret_code, ret_str = run_shell(self.shellcmd + 'ls -Zd ' + m_dir + i)
+                if ret_code != 0:
+                  continue
+                res = re.findall('u:object_r:(\\w+):s0', ret_str.decode())
+                exists.append(i)
+                if res:
+                  lib_file_type = res[0]
+                  break
+              if exists:
+                ret_code, ret_str = run_shell(self.shellcmd + 'ls -Zd ' + m_dir + 'framework')
+                if ret_code == 0:
+                  res = re.findall('u:object_r:(\\w+):s0', ret_str.decode())
+                  if res:
+                    jar_file_type = res[0]
+                    if len(res) < 10:
+                      libs.append('framework')
+                  else:
+                    libs.append('framework')
+                mount_path_dir = m_dir
+                break
+          else:
+            if Configuration.mount_path.startswith('/data/'):
+              mount_path_dir = Configuration.mount_path
+            owner = 'system'
+          if mount_path_dir:
+            use_nsenter = '/system/' in mount_path_dir or '/vendor/' in mount_path_dir
+            # use_nsenter = True
+            # if 'vendor' in mount_path_dir:
+            #   lib_file_type = 'vendor_file'
+            #   jar_file_type = 'vendor_framework_file'
+            cmds = []
+            new_lib_dst_32 = None
+            if '64' in self.cpu_abi:
+              libs.append('lib64')
+              new_app_lib_dst = mount_path_dir + 'lib64/' + lib_name
+              if lib_dst_32:
+                new_lib_dst_32 = mount_path_dir + 'lib/' + lib_name
+                libs.append('lib')
+            else:
+              new_app_lib_dst = mount_path_dir + 'lib/' + lib_name
+              libs.append('lib')
+
+            agent_dex = self.agent_dex
+            dex_lib_dir = mount_path_dir + "framework/"
+            new_agent_dex = dex_lib_dir + os.path.basename(agent_dex)
+
+            def check_file():
+              new_file_md5 = self.get_file_md5(new_app_lib_dst)
+              dirname = os.path.dirname(new_app_lib_dst)
+              if ori_file_md5 == new_file_md5:
+                self.lib_dst = new_app_lib_dst
+                self.mount_paths[dirname] = True
+                self.lib_dir = dirname + "/"
+              elif self.push_file(abi_lib, new_app_lib_dst, mode='644', file_type=lib_file_type, owner=owner):
+                self.lib_dst = new_app_lib_dst
+                self.mount_paths[dirname] = True
+                self.lib_dir = dirname + "/"
+              if lib_dst_32:
+                path_dir = os.path.dirname(new_lib_dst_32)
+                if self.get_file_md5(lib_dst_32) == self.get_file_md5(new_lib_dst_32):
+                  self.lib32_dst = new_lib_dst_32
+                  self.lib32_dir = path_dir + "/"
+                  self.mount_paths[path_dir] = True
+                elif self.push_file(lib_src_32, new_lib_dst_32, mode='644', file_type=lib_file_type, owner=owner):
+                  self.lib32_dst = new_lib_dst_32
+                  self.lib32_dir = path_dir + "/"
+                  self.mount_paths[path_dir] = True
+              self.push_file(Configuration.app_agent_file, new_agent_dex, mode='644', file_type=jar_file_type,
+                owner=owner)
+              if self.get_file_md5(agent_dex) == self.get_file_md5(new_agent_dex):
+                Configuration.app_plugin_home = dex_lib_dir
+                cached_property.reset(self, 'agent_dex', new_agent_dex)
+                jar_dir = dex_lib_dir[:-1]
+                self.mount_paths[jar_dir] = True
+
+            new_file_md5 = self.get_file_md5(new_app_lib_dst)
+            if not new_file_md5:
+              self.push_file(abi_lib, new_app_lib_dst, mode='644', file_type=lib_file_type, owner=owner)
+              new_file_md5 = self.get_file_md5(new_app_lib_dst)
+            if new_file_md5:
+              check_file()
+            else:
+              use_mount = not mount_path_dir.startswith('/data/') and not new_file_md5
+              if not use_mount:
+                cmds.append('mkdir -p ' + mount_path_dir)
+              cp_command = self.copy_script
+              # cmds.append('mount -t tmpfs -o size=512M,mode=0755,exec,dev,suid  tmpfs ' + new_lib_dir)
+              for i in libs:
+                dst_dir = mount_path_dir + i
+                if use_mount:
+                  tmp_dir = '/data/local/tmp/albatross/' + i + '/'
+                  cmds.append(f'rm -rf {tmp_dir} && mkdir -p ' + tmp_dir)
+                  staged_agent = None
+                  if i == 'lib64':
+                    staged_agent = tmp_dir + lib_name
+                    cmds.append(f'cp {app_lib_dst} {tmp_dir}')
+                    cmds.append(f'chcon  u:object_r:{lib_file_type}:s0 {staged_agent}')
+                  elif i == 'lib':
+                    if lib_dst_32:
+                      staged_agent = tmp_dir + lib_name
+                      cmds.append(f'cp {lib_dst_32} {tmp_dir}')
+                      cmds.append(f'chcon  u:object_r:{lib_file_type}:s0 {staged_agent}')
+                  else:
+                    staged_agent = tmp_dir + os.path.basename(agent_dex)
+                    cmds.append(f'cp {agent_dex} {tmp_dir}')
+                    cmds.append(f'chcon  u:object_r:{jar_file_type}:s0 {staged_agent}')
+                  # 把原始目录内容(含 oplus-framework-res.apk 等系统文件)连同各自的 SELinux 上下文复制进暂存目录
+                  cmds.append(f'{cp_command} {dst_dir} {tmp_dir[:-1]}')
+                  # 只对新加入的 agent 文件设置属主/权限，原始文件保持 copy_with_selinux 复制时的原状
+                  if staged_agent:
+                    cmds.append(f'chown {owner}:{owner} {staged_agent}')
+                    cmds.append(f'chmod 644 {staged_agent}')
+                  # bind 不改变 inode 的 SELinux 标签：bind 后该目录沿用它在 /data 下创建时的默认标签
+                  # (如 shell_data_file)，zygote 等域对这种类型的目录没有 dir{search} 权限，会读不到目录内的
+                  # 框架资源而崩溃。copy_with_selinux 只为目录内的文件/子目录恢复了上下文，遗漏了顶层目录本身，
+                  # 这里按原始系统目录的类型(framework→jar_file_type，lib→lib_file_type)补上顶层目录的上下文。
+                  dir_file_type = lib_file_type if 'lib' in i else jar_file_type
+                  cmds.append(f'chcon u:object_r:{dir_file_type}:s0 {tmp_dir[:-1]}')
+                  if use_nsenter:
+                    # if 'lib' in i:
+                    #   cmds.append(f'chcon -R u:object_r:{lib_file_type}:s0 {tmp_dir}*')
+                    # else:
+                    #   cmds.append(f'chcon -R u:object_r:{jar_file_type}:s0 {tmp_dir}*')
+                    # cmds.append(f'chown -R {owner}:{owner} {tmp_dir}*')
+                    # cmds.append(f'chmod -R 644  {tmp_dir}*')
+                    cmds.append(f'for daemon in zygote zygote64 adbd; '
+                                f'do pids=$(pidof "$daemon") || continue; '
+                                f'for z in $pids; '
+                                f'do echo "proc:$z"; '
+                                f'nsenter --mount=/proc/"$z"/ns/mnt --  /bin/mount --bind {tmp_dir}  {dst_dir}; '
+                                f'done; '
+                                f'done')
+                    cmds.append('wait')
+                    if 'lib' in i:
+                      cmds.append(f'chcon  u:object_r:{lib_file_type}:s0 {dst_dir}')
+                    else:
+                      cmds.append(f'chcon  u:object_r:{jar_file_type}:s0 {dst_dir}')
+                    # cmds.append('sleep 1')
+                  else:
+                    # 暂存目录此时已是“原始内容 + agent”的完整副本，直接整体 bind 到目标，
+                    # 一步原子替换：替换前 dst 仍是完整的原始系统目录、替换后立刻是完整副本，
+                    # 不存在原先“先挂空 tmpfs，再 mv/chmod -R/chcon -R 慢慢填”过程中
+                    # zygote fork 读不到 oplus-framework-res.apk 而 ENOENT 致命的空窗。
+                    # 权限与 SELinux 上下文已在暂存目录里按文件设好，这里不再对目标做 -R 递归修改
+                    # (避免 chmod -R 644 抹掉子目录可进入位、chcon -R 覆盖原始文件标签)。
+                    cmds.append(f'mkdir -p {dst_dir}')
+                    cmds.append(f'mount --bind {tmp_dir[:-1]} {dst_dir}')
+                else:
+                  cmds.append('mkdir -p ' + dst_dir)
+                  if i == 'lib64':
+                    cmds.append(f'cp {app_lib_dst} {dst_dir}')
+                    cmds.append(f'chcon -R u:object_r:{lib_file_type}:s0 {dst_dir}')
+                  elif i == 'lib':
+                    if lib_dst_32:
+                      cmds.append(f'cp {lib_dst_32} {dst_dir}')
+                      cmds.append(f'chcon -R u:object_r:{lib_file_type}:s0 {dst_dir}')
+                  else:
+                    cmds.append(f'cp {self.agent_dex} {dst_dir}')
+                    cmds.append(f'chcon -R u:object_r:{jar_file_type}:s0 {dst_dir}')
+                  cmds.append(f'chown -R {owner}:{owner} {dst_dir}/*')
+                  cmds.append(f'chmod 644  {dst_dir}/*')
+              # if use_nsenter:
+              #   cmds.append(f'chcon  u:object_r:{jar_file_type}:s0 {new_agent_dex}')
+              cmds.append('wait')
+              cmds.append('echo finish bind')
+              shell_command = ' && '.join(cmds)
+              script_tmp = tempfile.gettempdir() + '/bind.sh'
+              with open(script_tmp, 'w') as fp:
+                fp.write(shell_command)
+              self.push_file(script_tmp, '/data/local/tmp/script.sh', mode='700')
+              res = self.root_shell('/data/local/tmp/script.sh', timeout=120)
+              # os.remove(script_tmp)
+              time.sleep(1)
+              check_file()
+      client.set_arch_lib(self.lib_dst)
+      if lib_dst_32:
+        client.set_2nd_arch_lib(self.lib32_dst)
+
     if update and self.update_kill:
-      self.kill_process(os.path.basename(server_dst_path))
+      self.kill_process(server_dst_basename, 'update lib', reboot_count=5)
     else:
       try:
-        client = AlbatrossClient(local_port, '127.0.0.1', 'albatross-' + device_id, 500)
-        client.set_arch_lib(self.lib_dst)
-        if lib_dst_32:
-          client.set_2nd_arch_lib(self.lib32_dst)
+        client = self.albatross_client_impl(local_port, host, 'albatross-' + device_id, 1500)
+        sync_lib()
         return client
-      except:
-        self.kill_process(os.path.basename(server_dst_path))
+      except Exception as e:
+        old_pids = self.kill_process(server_dst_basename, 'connect fail:' + str(e), reboot_count=5)
+        if old_pids:
+          pids = self.pidof(server_dst_basename)
+          if pids and old_pids == pids:
+            self.reboot('kill albatross server fail')
+            raise DeviceReboot(f'device {self.device_id} kill server fail')
     if type(server_port) == str and server_port.startswith('localabstract:'):
       server_port = server_port.split(':')[1]
     if self.shell_user == 'shell':
@@ -740,18 +1103,67 @@ class AlbatrossDevice(object):
       cmd_prefix = "nohup "
       cmd = f'{self.shellcmd} "LD_LIBRARY_PATH={lib_dir} {cmd_prefix} {server_dst_path} {server_port} >/data/local/tmp/albatross.log 2>&1 &"'
     process = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
-    time.sleep(2)
-    process.terminate()
-    client = AlbatrossClient(local_port, '127.0.0.1', 'albatross-' + device_id, 500)
-    client.set_arch_lib(self.lib_dst)
-    if lib_dst_32:
-      client.set_2nd_arch_lib(self.lib32_dst)
+    try:
+      if self.usb_mode:
+        time.sleep(2)
+        client = self.albatross_client_impl(local_port, host, 'albatross-' + device_id, 500)
+      else:
+        client = None
+        for i in range(5):
+          time.sleep(4)
+          try:
+            client = self.albatross_client_impl(local_port, host, 'albatross-' + device_id, 500)
+            break
+          except TimeoutError as e:
+            raise
+          except OSError as e:
+            if str(e) == 'Socket closed':
+              continue
+            raise
+        else:
+          client = self.albatross_client_impl(local_port, host, 'albatross-' + device_id, 500)
+    finally:
+      process.terminate()
     if self.is_selinux_on():
       client.patch_selinux()
+    sync_lib()
+    if self.anti_detection:
+      self.hide_mount(client)
     return client
 
-  def restart_system_server(self):
-    print('try restart system server')
+  def hide_mount(self, client=None):
+    if client is None:
+      client = self.client
+    if 'apd' in self.magisk_install_cmd:
+      for p in ['zygote64', 'zygote']:
+        carry_on = True
+        for pid in self.pidof(p):
+          mount_result = client.umount(pid, '/debug_ramdisk/pts:/debug_ramdisk')
+          if mount_result != MountResult.MOUNT_SUCCESS:
+            carry_on = False
+            break
+        if not carry_on:
+          break
+    mount_paths = cached_property.get(self, 'mount_paths')
+    if mount_paths and len(mount_paths) > 1:
+      client.add_launch_umount(':'.join(mount_paths.keys()))
+
+  restart_system_callback = None
+
+  def restart_system_server(self, reason=''):
+    logger.info(f'{self.device_id} try restart system server:' + reason)
+    if self.restart_system_callback:
+      try:
+        self.restart_system_callback(self, reason)
+      except:
+        pass
+    desc = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time()))
+    if reason:
+      desc = desc + " " + reason
+    try:
+      self.shell(f'echo "{desc}" >> /data/local/tmp/reboot_system_server')
+    except:
+      pass
     self.root_shell('stop')
     time.sleep(0.5)
     self.root_shell('start')
@@ -759,7 +1171,7 @@ class AlbatrossDevice(object):
 
   def on_system_subscribe_close(self, client):
     if self.reconnect:
-      print('system_server subscriber close')
+      logger.info('system_server subscriber close')
       try:
         if client.reconnect():
           client.subscribe()
@@ -770,7 +1182,7 @@ class AlbatrossDevice(object):
 
   def on_system_client_close(self, client):
     if self.reconnect:
-      print('system_server client close')
+      logger.info('system_server client close')
       if not client.reconnect():
         cached_property.delete(self, "system_server_client")
 
@@ -805,18 +1217,17 @@ class AlbatrossDevice(object):
       server_pid = client.get_process_pid('system_server')
       if server_pid > 0 and agent_dst in self.root_shell(f'cat /proc/{server_pid}/maps'):
         if self.brand == DeviceBrand.RedMi:
-          self.reboot()
-          time.sleep(40)
+          self.reboot('agent update', 40)
           raise DeviceReboot(f'reboot device {self.device_id}')
         else:
-          self.restart_system_server()
+          self.restart_system_server('agent update')
         time.sleep(20)
         if self.brand in [DeviceBrand.RealMe, DeviceBrand.OnePlus]:
           time.sleep(20)
           self.back()
     server_pid = client.get_process_pid('system_server')
     if server_pid <= 0:
-      self.restart_system_server()
+      self.restart_system_server('system server dead')
       time.sleep(15)
       server_pid = client.get_process_pid('system_server')
     if server_pid <= 0:
@@ -883,7 +1294,7 @@ class AlbatrossDevice(object):
   @cached_property
   def cpu_abi(self):
     cpu_abi = self.shell('getprop ro.product.cpu.abi')
-    if cpu_abi:
+    if cpu_abi and cpu_abi in ['arm64-v8a', 'armeabi-v7a', 'x86_64', 'x86']:
       return cpu_abi
     file_type = self.shell('file /system/bin/sh')
     if 'arm64' in file_type:
@@ -893,15 +1304,14 @@ class AlbatrossDevice(object):
     if 'x86' in file_type:
       if '64' in file_type:
         return 'x86_64'
-    else:
       return 'x86'
-    return None
+    return cached_property.nil_value
 
   app_inject_flags = InjectFlag.KEEP | InjectFlag.UNIX
   app_init_flags = AlbatrossInitFlags.FLAG_LOG | AlbatrossInitFlags.FLAG_CALL_CHAIN | AlbatrossInitFlags.FLAG_INIT_RPC
 
   def on_launch_process(self, uid: int, pid: int, pkg: str, process: str, process_info: dict) -> byte:
-    print(f'launch process {uid}:{pid}:{process}', process_info)
+    logger.info(f'launch process {uid}:{pid}:{process} {process_info}')
     inject_record = self.process_launch_callback.get(uid)
     if inject_record:
       count = self.app_launch_count[uid]
@@ -952,11 +1362,10 @@ class AlbatrossDevice(object):
         if self.update_kill_system_server and server_pid > 0 and agent_dst in self.root_shell(
             f'cat /proc/{server_pid}/maps'):
           if self.brand == DeviceBrand.RedMi:
-            self.reboot()
-            time.sleep(40)
+            self.reboot('system server agent update', 40)
             raise DeviceReboot(f'reboot device {self.device_id}')
           else:
-            self.restart_system_server()
+            self.restart_system_server('system server agent update')
           time.sleep(20)
           if self.brand in [DeviceBrand.RealMe, DeviceBrand.OnePlus]:
             time.sleep(20)
@@ -972,7 +1381,7 @@ class AlbatrossDevice(object):
         system_server_restart_callback(self)
       return True
     except Exception as e:
-      print('init plugin env fail:' + str(e))
+      logger.error('init plugin env fail:' + str(e))
       return cached_property.nil_value
 
   def launch_fast(self, target_package, plugin_dex, plugin_class, plugin_params: str = None,
@@ -1005,7 +1414,7 @@ class AlbatrossDevice(object):
     self.start_app(target_package)
     return True
 
-  def attach_with_plugins(self, package_or_pid, plugins, init_flags=AlbatrossInitFlags.FLAG_LOG, extra_info=None):
+  def attach_with_plugins(self, package_or_pid, plugins, init_flags=None, extra_info=None):
     client = self.client
     uid = -1
     if isinstance(package_or_pid, str):
@@ -1021,6 +1430,8 @@ class AlbatrossDevice(object):
       for pid in pids:
         res = client.inject_albatross(pid, self.app_inject_flags, None)
         if res >= 0:
+          if init_flags is None:
+            init_flags = self.app_init_flags
           success_count = 0
           for plugin in plugins:
             res = client.load_plugin(pid, agent_dex, None, Configuration.albatross_class_name,
@@ -1058,7 +1469,7 @@ class AlbatrossDevice(object):
 
   def register_plugin(self, plugin_dex, plugin_class, plugin_params: str = None,
       plugin_flags: int = 0, plugin_lib=None):
-    assert os.path.exists(plugin_dex)
+    assert os.path.exists(plugin_dex), plugin_dex
     client = self.client
     plugin_name = os.path.basename(plugin_dex)
     if Configuration.lib_name == 'random':
@@ -1074,7 +1485,7 @@ class AlbatrossDevice(object):
     plugin_dex_device = Configuration.app_plugin_home + plugin_name
     is_update = self.push_file(plugin_dex, plugin_dex_device, mode='444', check=True)
     if plugin_lib:
-      assert os.path.exists(plugin_lib)
+      assert os.path.exists(plugin_lib), plugin_lib
       lib_name = os.path.basename(plugin_lib)
       is_64 = '64' in plugin_lib
       if is_64:
@@ -1110,13 +1521,13 @@ class AlbatrossDevice(object):
 
   def load_system_plugin(self, plugin_dex, plugin_class, plugin_params: str = None, plugin_flags: int = 0,
       plugin_lib: str | None = None):
-    assert os.path.exists(plugin_dex)
+    assert os.path.exists(plugin_dex), plugin_dex
     assert self.init_plugin_env
     client = self.client
     plugin_dex_device = Configuration.app_plugin_home + os.path.basename(plugin_dex)
     self.push_file(plugin_dex, plugin_dex_device, mode='444')
     if plugin_lib:
-      assert os.path.exists(plugin_lib)
+      assert os.path.exists(plugin_lib), plugin_lib
       pid = client.get_process_pid('system_server')
       if client.get_process_isa(pid) in [RunTimeISA.ISA_X86_64, RunTimeISA.ISA_ARM64]:
         lib_dst_device = self.lib_dir + os.path.basename(plugin_lib)
@@ -1134,7 +1545,7 @@ class AlbatrossDevice(object):
     if not uid:
       uid = self.get_package_uid(target_package)
     client = self.client
-    res = client.add_plugin_rule(plugin.plugin_id, uid, target_package if uid == SYSTEM_UID else None)
+    res = client.add_plugin_rule(plugin.plugin_id, uid, target_package if uid == SYSTEM_UID else None, timeout=30)
     if res == SetResult.MISS_INFO:
       extra_info = target_package + ":" + str(self.get_package_version_code(target_package))
       client.set_app_info(uid, extra_info)
@@ -1150,7 +1561,7 @@ class AlbatrossDevice(object):
       pids = [package_or_pid]
     success = []
     if pids:
-      assert os.path.exists(plugin_dex)
+      assert os.path.exists(plugin_dex), plugin_dex
       plugin_dex_device = Configuration.app_plugin_home + os.path.basename(plugin_dex)
       self.push_file(plugin_dex, plugin_dex_device, mode='444')
       for pid in pids:
@@ -1158,7 +1569,7 @@ class AlbatrossDevice(object):
         res = client.inject_albatross(pid, self.app_inject_flags, None)
         if res >= 0:
           if plugin_lib:
-            assert os.path.exists(plugin_lib)
+            assert os.path.exists(plugin_lib), plugin_lib
             if client.get_process_isa(pid) in [RunTimeISA.ISA_X86_64, RunTimeISA.ISA_ARM64]:
               lib_dst_device = self.lib_dir + os.path.basename(plugin_lib)
             else:
@@ -1202,8 +1613,8 @@ class AlbatrossDevice(object):
         if not_check or check_socket_port("127.0.0.1", local_port):
           break
     else:
-      local_port = get_valid_port()
-      self.forward(local_port, remote_port)
+      with get_available_port() as local_port:
+        self.forward(local_port, remote_port)
     return local_port
 
   def remove_albatross_port(self):
@@ -1305,8 +1716,8 @@ class AlbatrossDevice(object):
     paths = self.package_apk_path(package)
     if len(paths) == 1:
       dir_path = os.path.dirname(output_path)
-      if not os.path.exists(dir_path):
-        os.makedirs(dir_path)
+      if dir_path and not os.path.exists(dir_path):
+        os.makedirs(dir_path, exist_ok=True)
       if not os.path.exists(output_path) or overwrite:
         self.pull_file(paths[0], output_path)
       return output_path
@@ -1348,9 +1759,12 @@ class AlbatrossDevice(object):
         return False
       if v == int(version_code):
         return False
-      if ignore_gt and v > int(version_code):
-        return False
-    if not v and self.brand in [DeviceBrand.RealMe, DeviceBrand.OnePlus]:
+      if v > int(version_code):
+        if ignore_gt:
+          return False
+        else:
+          self.uninstall_package(package)
+    if self.brand in [DeviceBrand.RealMe, DeviceBrand.OnePlus]:
       self.silence_install(apk)
     else:
       res = self.adb_cmd('install -r -d -t ' + apk)
@@ -1381,7 +1795,7 @@ class AlbatrossDevice(object):
       sdk = int(run_shell(self.shellcmd + "getprop ro.build.version.sdk")[1].decode().strip())
       return sdk
     except:
-      return None
+      return cached_property.nil_value
 
   base_activity_pattern = re.compile(
     r"Run\s#\d+:\sActivityRecord{\w+\s\w+\s([\w\.]+/[\w\.]+)"
@@ -1405,16 +1819,26 @@ class AlbatrossDevice(object):
   def top_app(self):
     res = self.shell("dumpsys window | grep mCurrentFocus")
     if res:
-      result = re.findall(r'([\w.]+)/([\w.]+)', res)
+      result = re.findall(r'([\w.]+)/([\w.$]+)', res)
       if result:
-        return result[0]
+        # dumpsys window can print both a global/current value and one or more
+        # display-scoped mCurrentFocus values.  The first line may therefore be
+        # stale or from another focus owner; keep the last non-null window focus
+        # reported by WindowManager.
+        return result[-1]
+    # cmd = self.cmd + 'shell "dumpsys activity | grep mFoc"'
+    # cmd = self.cmd + 'shell  "dumpsys window | grep mCurrentFocus"'
+    # _, ret_str = run_shell(cmd)
+    # ret_str = ret_str.decode("utf-8")
     stack = self.get_activity_stack()
     if not stack:
       cmd = self.cmd + 'shell " dumpsys activity | grep -i mResumedActivity"'
       _, rstr = run_shell(cmd)
       stack = resume_activity_pattern.findall(rstr.decode())
-    top_stack = stack[0].split("/")
-    return top_stack[0], top_stack[1]
+    if stack:
+      top_stack = stack[0].split("/")
+      return top_stack[0], top_stack[1]
+    return None, None
 
   def pull_file(self, src_android, dst_pc, is_del=False):
     command = self.cmd + ' pull "{}" "{}"'.format(src_android, dst_pc)
@@ -1478,9 +1902,9 @@ class AlbatrossDevice(object):
   def cached_versions(self):
     return {}
 
-  def get_package_version_code(self, pkg):
+  def get_package_version_code(self, pkg, cached=True):
     cached_versions = self.cached_versions
-    if pkg in cached_versions:
+    if cached and pkg in cached_versions:
       return cached_versions[pkg]
     ret_str = self.run_as_shell('dumpsys package ' + pkg + " | grep versionCode= | head -n 10")
     if not ret_str:
@@ -1558,11 +1982,11 @@ class AlbatrossDevice(object):
       ip = self.connect_ip
     if not ip:
       return False
-    run_shell(f'{adb_path} -s {self.device_id} tcpip {self.tcp_port}')
+    run_shell(f'{AlbatrossDevice.adb} -s {self.device_id} tcpip {self.tcp_port}')
     for z in range(2):
-      ret_code, bs = run_shell(adb_path + ' connect ' + ip + ":" + str(self.tcp_port))
+      ret_code, bs = run_shell(AlbatrossDevice.adb + ' connect ' + ip + ":" + str(self.tcp_port))
       if b'failed' not in bs and b'connected to' in bs:
-        cmd = f'{adb_path} -s {ip} '
+        cmd = f'{AlbatrossDevice.adb} -s {ip} '
         shell_cmd = cmd + 'shell '
         time.sleep(0.3)
         for i in range(2):
@@ -1581,14 +2005,14 @@ class AlbatrossDevice(object):
     if not self.usb_mode:
       return False
     if '.' in self.cmd:
-      cmd = f'{adb_path} -s {self.device_id} '
+      cmd = f'{AlbatrossDevice.adb} -s {self.device_id} '
       shellcmd = cmd + 'shell '
       ret_code, bs = run_shell(shellcmd + 'echo hello')
       if b'hello' in bs:
         self.cmd = cmd
         self.shellcmd = shellcmd
         self.shellcmd_list = shellcmd.strip().split()
-        run_shell(f'{adb_path} disconnect {self.connect_ip}:{self.tcp_port}')
+        run_shell(f'{AlbatrossDevice.adb} disconnect {self.connect_ip}:{self.tcp_port}')
         return True
     return False
 
@@ -1599,7 +2023,7 @@ class AlbatrossDevice(object):
     # 提取数字（KB）
     ram_kb = re.findall(r'\d+', ram_output)
     if not ram_kb:
-      print("未解析到RAM大小")
+      logger.info("未解析到RAM大小")
       return None
     # 转换为GB（1GB = 1024*1024 KB）
     ram_gb = int(ram_kb[0]) / (1024 * 1024)
@@ -1635,11 +2059,18 @@ class AlbatrossDevice(object):
         rom_info["total_rom"] = str(round(max([int(i) for i in total_rom_kb]) / (1024 * 1024), 2)) + "G"
     return rom_info
 
-  def silence_install(self, pkg_path):
-    assert os.path.exists(pkg_path)
+  def silence_install(self, pkg_path, clear_cache=False, use_root=True, timeout=120):
+    assert os.path.exists(pkg_path), pkg_path
     temp_path = '/data/local/tmp/' + os.path.basename(pkg_path)
     self.push_file(pkg_path, temp_path)
-    self.root_shell('pm install -r ' + temp_path + " && rm " + temp_path)
+    if use_root:
+      shell = self.root_shell
+    else:
+      shell = self.shell
+    if clear_cache:
+      return shell('pm install -r -t ' + temp_path + " && rm " + temp_path, timeout=timeout)
+    else:
+      return shell('pm install -r -t ' + temp_path, timeout=timeout)
 
   @cached_property
   def storage_info(self):
@@ -1664,6 +2095,34 @@ class AlbatrossDevice(object):
           else:
             processes.append(pid)
     return processes
+
+  def list_opened_files_by_pid(self, pid):
+    """通过 PID 获取所有打开的文件路径"""
+
+    # 列出 fd 目录下所有文件描述符
+    fd_list = self.root_shell(f"ls /proc/{pid}/fd/").split()
+    if not fd_list:
+      logger.info("无法读取 fd 目录（可能权限不足）")
+      return []
+
+    opened_files = []
+    invalid_prefixes = ("pipe:", "/dev", "/proc", "anon_inode:")  # "socket:",
+
+    for fd in fd_list:
+      # 读取软链接真实路径
+      path = self.root_shell(f"readlink /proc/{pid}/fd/{fd}")
+      if not path:
+        continue
+
+      # 过滤无效路径
+      if path.startswith(invalid_prefixes):
+        continue
+      if path in opened_files:
+        continue
+
+      opened_files.append(path)
+
+    return opened_files
 
   def watch_plugin(_self, target_pkg: str, plugin: Plugin, change_restart=False, attach=False):
     from watchdog.events import FileSystemEventHandler
@@ -1714,7 +2173,7 @@ class AlbatrossDevice(object):
                 _self.client.load_plugin_by_id(pid, plugin.plugin_id)
 
         except Exception as e:
-          print(f"\n更新插件失败: {str(e)}", file=sys.stderr)
+          logger.error(f"\n更新插件失败: {str(e)}")
 
       def on_modified(self, event):
         """处理文件修改事件"""
@@ -1724,7 +2183,7 @@ class AlbatrossDevice(object):
       def on_created(self, event):
         """处理文件创建事件（针对文件被删除后重新创建的情况）"""
         if not event.is_directory and event.src_path == os.path.abspath(plugin_dex):
-          print("检测到版本文件重新创建")
+          logger.info("检测到版本文件重新创建")
           self.handle_plugin_change()
 
     event_handler = FileChangeHandler()
@@ -1732,14 +2191,14 @@ class AlbatrossDevice(object):
     observer = Observer()
     observer.schedule(event_handler, plugin_dex, recursive=False)
     observer.start()
-    print(f"开始监控插件: {Observer} ")
-    print("按Ctrl+C停止监控")
+    logger.info(f"开始监控插件: {Observer} ")
+    logger.info("按Ctrl+C停止监控")
     try:
       while True:
         time.sleep(5)
     except KeyboardInterrupt:
       observer.stop()
-      print("\n监控已停止")
+      logger.info("\n监控已停止")
     observer.join()
 
 
@@ -1756,6 +2215,7 @@ class DeviceManager:
 
   def get_devices(self, device_id) -> AlbatrossDevice:
     if device_id and ":" in device_id:
+      adb_path = AlbatrossDevice.adb
       if device_id not in run_shell(adb_path + " devices")[1].decode():
         if "." in device_id or "localhost" in device_id:
           run_shell(adb_path + " connect " + device_id, timeout=default_connect_timeout)
@@ -1771,7 +2231,7 @@ class DeviceManager:
     else:
       device_id = devices[0]
       if len(devices) > 1:
-        print("more than one device,default choose device " + device_id)
+        logger.info("more than one device,default choose device " + device_id)
     device_tables = self.devices
     if device_id in device_tables:
       device = device_tables[device_id]

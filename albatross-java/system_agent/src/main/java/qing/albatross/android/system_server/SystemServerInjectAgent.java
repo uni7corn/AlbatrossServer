@@ -36,14 +36,20 @@ import android.os.Build;
 import android.os.IInterface;
 import android.os.UserHandle;
 
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
+import kotlin.NotImplementedError;
 import qing.albatross.agent.AlbatrossPlugin;
 import qing.albatross.agent.DynamicPluginManager;
 import qing.albatross.agent.PluginMessage;
+import qing.albatross.annotation.MethodBackup;
+import qing.albatross.annotation.StaticMethodBackup;
+import qing.albatross.annotation.TargetClass;
 import qing.albatross.common.AppMetaInfo;
+import qing.albatross.common.ThreadConfig;
 import qing.albatross.core.Albatross;
 import qing.albatross.exception.AlbatrossErr;
 import qing.albatross.server.JsonFormatter;
@@ -67,6 +73,66 @@ public class SystemServerInjectAgent extends UnixRpcInstance implements SystemSe
     if (interceptAll)
       return NO_FILTER;
     return interceptApps.get(callingUid);
+  }
+
+  @Override
+  public byte clearUid(int uid) {
+    byte result = 0;
+    if (watchApps.remove(uid) != null) {
+      result += 1;
+    }
+    if (interceptApps.remove(uid) != null) {
+      result += 1;
+    }
+    return result;
+  }
+
+
+  @TargetClass(className = "dalvik.system.VMRuntime")
+  static class VMRuntimeH {
+
+    @StaticMethodBackup
+    static native Object getRuntime();
+
+    @MethodBackup
+    static native void requestConcurrentGC(Object thiz);
+
+  }
+
+  @Override
+  public void stabilityTest(int count) {
+    Thread t = new Thread("test:" + count) {
+      @Override
+      public void run() {
+        for (int j = 0; j < count; j++) {
+          ArrayList<String> s = new ArrayList<>();
+          for (int i = 0; i < 1024; i++) {
+            s = new ArrayList<>();
+            s.add(i + "demo");
+          }
+          String h = "hash:" + s.hashCode() + ":" + s.size();
+          try {
+            Albatross.hookClass(VMRuntimeH.class);
+            VMRuntimeH.requestConcurrentGC(VMRuntimeH.getRuntime());
+          } catch (AlbatrossErr e) {
+            Albatross.log("vm", e);
+          }
+          System.gc();
+          collectData("test:" + j + " " + h);
+          try {
+            Thread.sleep(100);
+          } catch (InterruptedException e) {
+          }
+          if ((j & 7) == 0) {
+            Albatross.log("gc:" + j, new Exception(ThreadConfig.myId()));
+          } else {
+            PluginMessage.log("gc test:" + j);
+          }
+        }
+        collectData("finished test:" + count);
+      }
+    };
+    t.start();
   }
 
 
@@ -149,7 +215,9 @@ public class SystemServerInjectAgent extends UnixRpcInstance implements SystemSe
 
   @Override
   public boolean setInterceptAll(boolean intercept) {
-    return interceptAll = intercept;
+    boolean old = interceptAll;
+    interceptAll = intercept;
+    return old;
   }
 
   boolean isInit = false;
@@ -168,6 +236,11 @@ public class SystemServerInjectAgent extends UnixRpcInstance implements SystemSe
   public String getFrontActivityQuick() {
     ComponentName componentName = getFrontActivityComponent();
     return JsonFormatter.fmt(new Object[]{componentName.getPackageName(), componentName.getClassName()});
+  }
+
+  @Override
+  public void setAppAndroidId(int uid, String android_id) throws AlbatrossErr {
+    throw new NotImplementedError();
   }
 
 
@@ -536,6 +609,7 @@ public class SystemServerInjectAgent extends UnixRpcInstance implements SystemSe
     return STRING_SUCCESS;
   }
 
+  public native void collectData(String data);
 
   @Override
   public int getVersion() {

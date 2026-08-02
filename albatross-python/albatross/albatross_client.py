@@ -18,6 +18,7 @@ from enum import IntEnum, IntFlag
 
 from .rpc_client import RpcClient, byte, read_string
 from .rpc_client import rpc_api, broadcast_api, void, ByteEnum
+from .rpc_common import u32, logger
 from .wrapper import cached_class_property
 
 
@@ -29,6 +30,7 @@ class InjectFlag(IntEnum):
   TEST = 0x8
   KEEP = 0x10
   UNIX = 0x20
+  SOCKET = 0x40
 
 
 class AlbatrossInitFlags(IntFlag):
@@ -47,8 +49,11 @@ class AlbatrossInitFlags(IntFlag):
   FLAG_INIT_RPC = 0x1000
   FLAG_CALL_CHAIN = 0x2000
   FLAG_ANTI_DETECTION = 0x4000
-  FLAG_LOG = 0x10000
-  REDIRECT_LOG = 0x20000
+  FLAG_INTERPRETER = 0x8000
+  # FLAG_NOT_INS_HOOK = 0x10000
+
+  FLAG_LOG = 0x80000
+  REDIRECT_LOG = 0x100000
 
 
 class InjectResult(ByteEnum):
@@ -78,8 +83,8 @@ class DexLoadResult(ByteEnum):
   DEX_CLASS_NO_FIND = 5
   DEX_INIT_FAIL = 6
   METHOD_NO_FIND = 7
-  DEX_SYSTEM_SERVER_ERR = 9,
-  DEX_PROCESS_SLEEPING = 10,
+  DEX_SYSTEM_SERVER_ERR = 9
+  DEX_PROCESS_SLEEPING = 10
   DEX_LOAD_SUCCESS = 20
   DEX_ALREADY_LOAD = 21
 
@@ -92,6 +97,15 @@ class SetResult(ByteEnum):
   DATA_ERR = 4
   SET_CHANGE = 5
   MISS_INFO = 6
+
+
+class MountResult(ByteEnum):
+  MOUNT_SUCCESS = 0
+  MOUNT_OPEN_FAIL = 1
+  MOUNT_FORK_FAIL = 2
+  MOUNT_SET_NS_FAIL = 3
+  MOUNT_FAIL = 4
+  MOUNT_SWITCH_FAIL = 5
 
 
 class ShellExecResult(object):
@@ -500,11 +514,11 @@ class AlbatrossClient(RpcClient):
 
   @broadcast_api
   def process_disconnect(self, pid: int) -> void:
-    print('process disconnect', pid)
+    logger.info('process disconnect %d', pid)
 
   @broadcast_api
   def system_server_die(self) -> void:
-    print('system server die')
+    logger.info('system server die')
 
   @broadcast_api
   def launch_process(self, uid: int, pid: int, pkg: str, process: str, process_info: dict) -> void:
@@ -617,7 +631,42 @@ class AlbatrossClient(RpcClient):
     pass
 
   @rpc_api
+  def mount(self, pid: int, mount_path: str, is_mount: bool = True, fork: bool = False) -> MountResult:
+    pass
+
+  @rpc_api
+  def add_launch_mount(self, mount_path: str) -> bool:
+    pass
+
+  @rpc_api
+  def add_launch_umount(self, mount_path: str) -> bool:
+    pass
+
+  @rpc_api
+  def remove_launch_umount(self, mount_path: str = None) -> byte:
+    pass
+
+  @rpc_api
+  def mount_config(self, pid: int) -> MountResult:
+    pass
+
+  def umount(self, pid: int, mount_path: str, fork: bool = True) -> MountResult:
+    return self.mount(pid, mount_path, False, fork)
+
+  @rpc_api
   def watch_app(self, uid: int) -> bool:
+    pass
+
+  @rpc_api
+  def support_extend_kpm(self) -> bool:
+    pass
+
+  @rpc_api
+  def hide_path(self, path: str, uid: u32 = 10000) -> bool:
+    pass
+
+  @rpc_api
+  def set_dex_load_timeout(self, sec: u32) -> int:
     pass
 
   @staticmethod

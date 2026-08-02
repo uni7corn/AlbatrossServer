@@ -12,8 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import threading
 import sys
+import asyncio
+import inspect
+import threading
+import weakref
 from collections import defaultdict
 
 
@@ -78,21 +81,61 @@ class cached_property(object):
 
   def __init__(self, func):
     self.__doc__ = getattr(func, "__doc__")
+    self.__name__ = getattr(func, "__name__", None)
     self.func = func
+    self.is_async = inspect.iscoroutinefunction(func)
     self.lock = threading.RLock()
+    self.object_locks = {}
 
   def __get__(self, obj, cls):
     func = self.func
     if obj is None:
       return self
     attr_name = func.__name__
+    if self.is_async:
+      return self._get_async(obj, attr_name)
     obj_dict = obj.__dict__
     val = obj_dict.get(attr_name, nil_value)
     if val is nil_value:
-      with TimeoutLock(self.lock, 10):
+      obj_id = id(obj)
+      with self.lock:
+        obj_lock = self.object_locks.get(obj_id)
+        if obj_lock is None:
+          acquire_lock = True
+          obj_lock = threading.RLock()
+          self.object_locks[obj_id] = obj_lock
+        else:
+          acquire_lock = False
+      try:
+        with obj_lock:
+          val = obj_dict.get(attr_name, nil_value)
+          if val is nil_value:
+            val = func(obj)
+            if val is not nil_value:
+              obj_dict[attr_name] = val
+      finally:
+        if acquire_lock:
+          with self.lock:
+            if self.object_locks.get(obj_id) is obj_lock:
+              self.object_locks.pop(obj_id, None)
+    return val
+
+  async def _get_async(self, obj, attr_name):
+    obj_dict = obj.__dict__
+    val = obj_dict.get(attr_name, nil_value)
+    if val is nil_value:
+      lock_name = f"__cached_property_async_lock_{attr_name}"
+      async_lock = obj_dict.get(lock_name)
+      if async_lock is None:
+        with self.lock:
+          async_lock = obj_dict.get(lock_name)
+          if async_lock is None:
+            async_lock = asyncio.Lock()
+            obj_dict[lock_name] = async_lock
+      async with async_lock:
         val = obj_dict.get(attr_name, nil_value)
         if val is nil_value:
-          val = func(obj)
+          val = await self.func(obj)
           if val is not nil_value:
             obj_dict[attr_name] = val
     return val
@@ -113,6 +156,17 @@ class cached_property(object):
   def pop(obj, attr):
     return obj.__dict__.pop(attr, nil_value)
 
+  @staticmethod
+  def remove_cached_property(obj):
+    count = 0
+    props = obj.__class__.__dict__
+    for k, v in props.items():
+      if isinstance(v, cached_property):
+        res = obj.__dict__.pop(k, nil_value)
+        if res is not nil_value:
+          count += 1
+    return count
+
 
 class cached_class_property(object):
   v = nil_value
@@ -122,6 +176,8 @@ class cached_class_property(object):
 
   def __init__(self, func):
     self.__doc__ = getattr(func, "__doc__")
+    self.__name__ = getattr(func, "__name__", None)
+    self.is_async = inspect.iscoroutinefunction(func)
     if sys.gettrace():
       v = [False]
 
@@ -129,58 +185,109 @@ class cached_class_property(object):
         if v[0] is True:
           return nil_value
         v[0] = True
-        ret = func(*args, **kwargs)
-        v[0] = False
-        return ret
+        try:
+          return func(*args, **kwargs)
+        finally:
+          v[0] = False
 
-      _wrapper.__name__ = func.__name__
-      self.func = _wrapper
+      async def _async_wrapper(*args, **kwargs):
+        if v[0] is True:
+          return nil_value
+        v[0] = True
+        try:
+          return await func(*args, **kwargs)
+        finally:
+          v[0] = False
+
+      if self.is_async:
+        _async_wrapper.__name__ = func.__name__
+        self.func = _async_wrapper
+      else:
+        _wrapper.__name__ = func.__name__
+        self.func = _wrapper
     else:
       self.func = func
     self.lock = threading.RLock()
+    self.async_locks = weakref.WeakKeyDictionary()
 
   @staticmethod
   def reset(cls, attr, v):
+    cls_property = cached_class_property._find_descriptor(cls, attr)
+    if cls_property is not None:
+      cls_property.v = v
+    #   if not cls_property.is_async:
+    #     setattr(cls_property._owner_cls(cls), attr, v)
+    # else:
     setattr(cls, attr, v)
 
   @staticmethod
   def delete(cls, attr):
+    cls_property = cached_class_property._find_descriptor(cls, attr)
+    if cls_property is None:
+      try:
+        delattr(cls, attr)
+        return True
+      except Exception:
+        return False
+    owner_cls = cls_property._owner_cls(cls)
     try:
-      delattr(cls, attr)
-      cls_property = cached_class_property.cls_property_tables[cls][attr]
       cls_property.v = nil_value
-      setattr(cls, attr, cls_property)
+      setattr(owner_cls, attr, cls_property)
       return True
-    except:
+    except Exception:
       return False
 
   @staticmethod
   def pop(cls, attr):
-    if hasattr(cls, attr):
-      v = getattr(cls, attr)
-      delattr(cls, attr)
+    cls_property = cached_class_property._find_descriptor(cls, attr)
+    if cls_property is not None:
+      v = cls_property.v
+      cached_class_property.delete(cls, attr)
       return v
     return nil_value
 
   @staticmethod
   def try_get(cls, attr, default_value=nil_value):
-    if attr not in cls.__dict__:
+    cls_property = cached_class_property._find_descriptor(cls, attr)
+    if cls_property is None:
+      if hasattr(cls, attr):
+        v = getattr(cls, attr)
+        return v
       return default_value
-    v = cls.__dict__[attr]
-    if isinstance(v, cached_class_property):
+    v = cls_property.v
+    if v is nil_value:
       return default_value
-    if hasattr(cls, attr):
-      v = getattr(cls, attr)
-      return v
-    return default_value
+    return v
+
+  @classmethod
+  def _find_descriptor(cls, owner_cls, attr):
+    for base in owner_cls.__mro__:
+      descriptor = cls.cls_property_tables.get(base, {}).get(attr)
+      if descriptor is not None:
+        return descriptor
+      value = base.__dict__.get(attr, nil_value)
+      if isinstance(value, cached_class_property):
+        return value
+    return None
+
+  def _owner_cls(self, cls):
+    func_name = self.func.__name__
+    if cls.__dict__.get(func_name) is self:
+      return cls
+    for base in cls.__mro__:
+      if self.cls_property_tables.get(base, {}).get(func_name) is self:
+        return base
+      if base.__dict__.get(func_name) is self:
+        return base
+    return cls
 
   def __get__(self, obj, cls):
     func = self.func
     func_name = func.__name__
+    if self.is_async:
+      return self._get_async(obj, cls)
     v = self.v
-    cls_base = cls
-    while func_name not in cls_base.__dict__:
-      cls_base = cls_base.__base__
+    cls_base = self._owner_cls(cls)
     if v is nil_value:
       with self.lock:
         v = self.v
@@ -196,12 +303,34 @@ class cached_class_property(object):
       return getattr(obj, func_name)
     return v
 
+  async def _get_async(self, obj, cls):
+    func = self.func
+    func_name = func.__name__
+    v = self.v
+    cls_base = self._owner_cls(cls)
+    if v is nil_value:
+      with self.lock:
+        async_lock = self.async_locks.get(cls_base)
+        if async_lock is None:
+          async_lock = asyncio.Lock()
+          self.async_locks[cls_base] = async_lock
+      async with async_lock:
+        v = self.v
+        if v is nil_value:
+          v = await func(cls)
+          if v is not nil_value:
+            self.cls_property_tables[cls_base][func_name] = self
+            self.v = v
+    if obj is not None and v.__class__.__name__ == 'function':
+      return getattr(obj, func_name)
+    return v
+
 
 class cached_subclass_property(cached_class_property):
 
   def __init__(self, func):
     super().__init__(func)
-    self.value_tables = {}
+    self.value_tables = weakref.WeakKeyDictionary()
 
   @staticmethod
   def try_get(cls, attr, default_value=nil_value):
@@ -213,11 +342,15 @@ class cached_subclass_property(cached_class_property):
     return default_value
 
   @staticmethod
+  def reset(cls, attr, v):
+    setattr(cls, attr, v)
+
+  @staticmethod
   def delete(cls, attr):
     try:
       delattr(cls, attr)
       return True
-    except:
+    except Exception:
       return False
 
   def __get__(self, obj, cls):
@@ -225,6 +358,8 @@ class cached_subclass_property(cached_class_property):
     func_name = func.__name__
     if func_name in cls.__dict__:
       raise Exception("can not call class property in abstract class {}".format(cls.__name__))
+    if self.is_async:
+      return self._get_async(obj, cls)
     value_tables = self.value_tables
     v = value_tables.get(cls, nil_value)
     if v is nil_value:
@@ -238,6 +373,27 @@ class cached_subclass_property(cached_class_property):
     else:
       setattr(cls, func_name, v)
     value_tables.pop(cls, None)
+    if obj is not None and v.__class__.__name__ == 'function':
+      return getattr(obj, func_name)
+    return v
+
+  async def _get_async(self, obj, cls):
+    func = self.func
+    func_name = func.__name__
+    value_tables = self.value_tables
+    v = value_tables.get(cls, nil_value)
+    if v is nil_value:
+      with self.lock:
+        async_lock = self.async_locks.get(cls)
+        if async_lock is None:
+          async_lock = asyncio.Lock()
+          self.async_locks[cls] = async_lock
+      async with async_lock:
+        v = value_tables.get(cls, nil_value)
+        if v is nil_value:
+          v = await func(cls)
+          if v is not nil_value:
+            value_tables[cls] = v
     if obj is not None and v.__class__.__name__ == 'function':
       return getattr(obj, func_name)
     return v

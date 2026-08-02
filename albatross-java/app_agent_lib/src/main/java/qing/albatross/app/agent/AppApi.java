@@ -24,13 +24,21 @@ public interface AppApi {
   @Broadcast
   void send(String content, String exception);
 
+  @Broadcast
+  void onLibLoad(String lib, String threadName);
+
 
   String findMethod(String className, String methodName, int numArgs, String args);
 
-
   int hookMethod(String className, String methodName, int numArgs, String args, int minDexPc, int maxDexPc, boolean safeToString);
 
+  String hookClass(String className, boolean application, int scope, boolean safeToString);
+
+  String unhookClass(String className, boolean application, int scope);
+
   boolean unhookMethod(String className, String methodName, int numArgs, String args);
+
+  void decompileAll();
 
   String printAllClassLoader();
 
@@ -42,7 +50,23 @@ public interface AppApi {
 
   boolean finishRedirectAppLog();
 
-  String findClass(String className,boolean applicationLoader,int execMode);
+  String findClass(String className, boolean applicationLoader, int execMode);
 
   String classLoaders(boolean sync);
+
+  String getModules(boolean includeSys);
+
+  String getFunctions(String module);
+
+  void watchFunc(String symbol, long address);
+
+  void initNativeLog();
+
+  void watchLibraryLoad(boolean on);
+
+  String dumpNativeMethod();
+
+  String readFile(String path);
+
+  void setToStringConfig(int maxLength, boolean showBytes);
 }

@@ -12,13 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import json
+import logging
 import socket
 import struct
 from dataclasses import dataclass
 from enum import Enum
 
 from .wrapper import cached_subclass_property
-
+logger = logging.getLogger("albatross")
 MSG_APIS = 3
 CALL_ID_MASK = 0xffff
 BROADCAST_RESULT_NO_HANDLER = -120
@@ -45,6 +46,10 @@ class double(float):
 
 
 class long(int):
+  pass
+
+
+class u32(int):
   pass
 
 
@@ -144,7 +149,7 @@ def rpc_receive_data(sock):
     else:
       data = b''.join(buff_list)
     if len(data) != data_len_expect:
-      print("expect get data {},but get {}".format(data_len, len(data)))
+      logger.info(f"expect get data {data_len},but get {len(data)}")
   else:
     data = None
   if result >= 128:
@@ -175,7 +180,7 @@ def read_json(data, idx):
   try:
     return json.loads(s), idx
   except Exception as e:
-    print('decode json fail', s, e)
+    logger.error('decode json fail %s %s', s, e)
   return s, idx
 
 
@@ -188,6 +193,11 @@ def read_bytes(data, idx):
 
 def read_int(data, idx):
   i, = struct.unpack('<i', data[idx:idx + 4])
+  return i, idx + 4
+
+
+def read_u32(data, idx):
+  i, = struct.unpack('<I', data[idx:idx + 4])
   return i, idx + 4
 
 
@@ -225,6 +235,10 @@ def read_long(data, idx):
 
 def put_long(data):
   return struct.pack('<q', data)
+
+
+def put_u32(data):
+  return struct.pack('<I', data)
 
 
 def put_dict(data):
@@ -302,11 +316,11 @@ def put_bytes(b: bytes):
 
 
 arg_convert_tables = {int: put_int, str: put_string, str | None: put_string, bytes: put_bytes, bool: put_bool,
-                      float: put_float, double: put_double, byte: put_byte, long: put_long, socket.socket: nop,
+                      float: put_float, double: put_double, byte: put_byte, long: put_long, u32: put_u32, socket.socket: nop,
                       dict: put_dict}
 
 arg_read_tables = {int: read_int, str: read_string, str | None: read_string, byte: read_byte, bool: read_bool,
-                   float: read_float, double: read_double, short: read_short, long: read_long, dict: read_json,
+                   float: read_float, double: read_double, short: read_short, long: read_long, u32: read_u32, dict: read_json,
                    list: read_json, bytes: read_bytes, socket.socket: socket.socket}
 
 

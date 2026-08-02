@@ -28,6 +28,7 @@ import android.util.SparseArray;
 
 import org.json.JSONObject;
 
+import qing.albatross.annotation.CallWay;
 import qing.albatross.annotation.ExecutionOption;
 import qing.albatross.annotation.FuzzyMatch;
 import qing.albatross.annotation.MethodBackup;
@@ -46,9 +47,9 @@ public class ActivityManagerServiceH {
 //  public ActivityTaskManagerService mActivityTaskManager;
 
 
-  @TargetClass(className = "com.android.server.am.ActivityManagerService$PidMap", required = false)
+  @TargetClass(className = "com.android.server.am.ActivityManagerService$PidMap", required = false, targetExec = ExecutionOption.DO_NOTHING)
   public static class PidMapH {
-    @MethodBackup
+    @MethodBackup(callWay = CallWay.MIRROR)
     public static native Object get(Object pidMap, int pid);
   }
 
@@ -73,6 +74,14 @@ public class ActivityManagerServiceH {
     interceptCheck(ams, pid, callingUid);
     attachApplicationLocked$Hook_U(ams, iApplicationThread, pid, callingUid, startSeq);
   }
+
+  @MethodHookBackup(minSdk = 33)
+  static void attachApplicationLocked$Hook_Xiaomi(Object ams, @FuzzyMatch Object iApplicationThread,
+                                                  int pid, int callingUid, long startSeq, @FuzzyMatch Object iApplicationThreadExt) {
+    interceptCheck(ams, pid, callingUid);
+    attachApplicationLocked$Hook_Xiaomi(ams, iApplicationThread, pid, callingUid, startSeq, iApplicationThreadExt);
+  }
+
 
   private static void interceptCheck(Object ams, int pid, int callingUid) {
     if (mActivityManagerService == null)
@@ -106,6 +115,9 @@ public class ActivityManagerServiceH {
         } else {
           if (Build.VERSION.SDK_INT >= 29) {
             Object hostingRecord = ProcessRecordH.hostingRecord.get(processRecord);
+            if (hostingRecord == null) {
+              return;
+            }
             name = HostingRecordH.getName(hostingRecord);
             componentType = HostingRecordH.getType(hostingRecord);
           }

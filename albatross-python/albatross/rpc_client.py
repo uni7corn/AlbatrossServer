@@ -353,7 +353,7 @@ class SocketMonitor(threading.Thread):
     if self.is_alive():
       self.join(timeout=5)
       if self.is_alive():
-        print("Warning: SocketMonitor thread did not terminate properly")
+        logger.warning("Warning: SocketMonitor thread did not terminate properly")
     else:
       RpcClient.log('socket monitor closed')
     try:
@@ -526,10 +526,14 @@ class RpcClient(metaclass=RpcMeta):
 
   def connect(self):
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(20)
-    sock.connect((self.host, self.port))
-    self.get_apis(sock)
-    sock.settimeout(self.default_timeout)
+    try:
+      sock.settimeout(20)
+      sock.connect((self.host, self.port))
+      self.get_apis(sock)
+      sock.settimeout(self.default_timeout)
+    except Exception as e:
+      sock.close()
+      raise
     self.sock = sock
     if use_polling:
       get_monitor().register_socket(sock, self.on_read_win)
@@ -675,8 +679,8 @@ class RpcClient(metaclass=RpcMeta):
             if convertor:
               cmd, idx, to_send = convertor(cmd, idx, result)
           else:
+            self.log(f'{self.name} get broadcast {cmd} no handler register! receive：{idx}, {data}')
             cmd = BROADCAST_RESULT_NO_HANDLER
-            self.log(f'broadcast {cmd} no handler! receive：{idx}, {data}')
         except Exception as e:
           self.log(f'do {broadcast_name} receive error')
           traceback.print_exc()
@@ -730,7 +734,8 @@ class RpcClient(metaclass=RpcMeta):
         self.subscribe_thread = True
         return True
       else:
-        subscribe_thread = threading.Thread(target=self.__subscribe_loop, name='{}:subscribe'.format(self.name))
+        subscribe_thread = threading.Thread(target=self.__subscribe_loop, name='{}:subscribe'.format(self.name),
+          daemon=True)
         subscribe_thread.start()
         self.subscribe_thread = subscribe_thread
         return subscribe_thread
@@ -769,7 +774,7 @@ class RpcClient(metaclass=RpcMeta):
 
   @broadcast_api
   def broadcast_test(self, s: str) -> int:
-    print('get broadcast test:' + s)
+    logger.info('get broadcast test:' + s)
     return len(s)
 
   def shutdown(self):

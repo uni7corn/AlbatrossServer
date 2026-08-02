@@ -15,6 +15,7 @@
 from enum import IntFlag, IntEnum
 
 from albatross.rpc_client import RpcClient, rpc_api, void, broadcast_api
+from albatross.rpc_common import long, logger
 
 
 class InsHookResult(IntEnum):
@@ -23,6 +24,12 @@ class InsHookResult(IntEnum):
   CLASS_NOT_FIND = -1
   METHOD_NOT_FIND = -2
   HOOK_FAIL = -3
+
+
+class MethodScope(IntFlag):
+  Static = 1
+  Instance = 2
+  Constructor = 4
 
 
 class ExecutionOption(IntFlag):
@@ -118,12 +125,63 @@ class AppClient(RpcClient):
     pass
 
   @rpc_api
+  def hook_class(self, class_name: str, application: bool = True, scope: MethodScope = MethodScope.Instance,
+      safe_tostring: bool = False) -> str:
+    pass
+
+  @rpc_api
+  def unhook_class(self, class_name: str, application: bool = True, scope: MethodScope = MethodScope.Instance) -> str:
+    pass
+
+  @rpc_api
   def class_loaders(self, sync: bool) -> str:
+    pass
+
+  @rpc_api
+  def get_functions(self, lib_path: str) -> list:
+    pass
+
+  @rpc_api
+  def get_modules(self, include_sys: bool = False) -> list:
+    pass
+
+  @rpc_api
+  def init_native_log(self) -> void:
+    pass
+
+  @rpc_api
+  def watch_func(self, symbol: str, address: long) -> void:
+    pass
+
+  @rpc_api
+  def watch_library_load(self, on: bool = True) -> void:
+    pass
+
+  @rpc_api
+  def dump_native_method(self) -> str:
     pass
 
   @broadcast_api
   def send(self, content: str, exception: str) -> void:
     if exception:
-      print("[#]", content, exception)
+      logger.error("[#] %s %s", content, exception)
     elif not self.quiet:
-      print("[*] " + content)
+      logger.info("[*] " + content)
+
+  @broadcast_api
+  def on_lib_load(self, lib_name: str, thread_id: str) -> void:
+    logger.info(f'load library {lib_name} by {thread_id}')
+
+  @rpc_api
+  def set_to_string_config(self, max_length: int, show_bytes: bool = True) -> void:
+    pass
+
+  @rpc_api
+  def read_file(self, path: str) -> str:
+    pass
+
+  def read_maps(self):
+    return self.read_file('/proc/self/maps')
+
+  def read_smaps(self):
+    return self.read_file('/proc/self/smaps')

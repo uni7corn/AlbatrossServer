@@ -166,11 +166,11 @@ public class DynamicPluginManager {
       constructor.setAccessible(true);
       plugin = constructor.newInstance(libName, arguments, flags);
       pluginCache.put(pluginKey, plugin);
-      Albatross.log("load plugin " + plugin.pluginName() + " success");
+      Albatross.log("create plugin " + plugin.pluginName() + " success");
       return plugin;
     } catch (Throwable e) {
       reason[0] = DEX_INIT_FAIL;
-      Albatross.log("Failed to load plugin: " + pluginClassName + " from " + pluginDexPath, e);
+      Albatross.log("Failed to create plugin: " + pluginClassName + " from " + pluginDexPath, e);
     }
     return null;
   }

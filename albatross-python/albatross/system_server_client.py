@@ -14,7 +14,7 @@
 
 from .albatross_client import AlbatrossClient, InjectFlag, AlbatrossInitFlags
 from .rpc_client import rpc_api, broadcast_api, byte, RpcClient
-from .rpc_common import void
+from .rpc_common import void, logger
 from .wrapper import cached_class_property
 
 
@@ -85,7 +85,7 @@ class SystemServerClient(RpcClient):
     """
 
   @rpc_api
-  def start_activity(self, pkg: str, activity: str | None, user_id: int) -> str:
+  def start_activity(self, pkg: str, activity: str | None = None, user_id: int = 0) -> str:
     """
     启动Activity
 
@@ -112,6 +112,10 @@ class SystemServerClient(RpcClient):
 
   def start_app(self, pkg: str):
     return self.start_activity(pkg, None, 0)
+
+  @rpc_api
+  def set_intercept_all(self, v: bool) -> bool:
+    pass
 
   @rpc_api
   def set_intercept_app(self, pkg: str | None, clear: bool = True) -> int:
@@ -141,13 +145,13 @@ class SystemServerClient(RpcClient):
   @broadcast_api
   def launch_process(self, uid: int, pid: int, pkg: str, process: str, process_info: dict) -> byte:
     if self.debug:
-      print(f'launch process {uid}:{pid}:{process}', process_info)
+      logger.info(f'launch process {uid}:{pid}:{process} {process_info}')
     return byte(-1)
 
   @broadcast_api
   def collect_data(self, data: str) -> void:
     if self.debug:
-      print('collect data', data)
+      logger.info('collect data %s', data)
 
   @rpc_api
   def add_watch_app(self, pkg: str, clear: bool = False) -> int:
@@ -155,6 +159,10 @@ class SystemServerClient(RpcClient):
 
   @rpc_api
   def set_app_android_id(self, uid: int, android_id: str) -> void:
+    pass
+
+  @rpc_api
+  def clear_uid(self, uid: int) -> byte:
     pass
 
   @rpc_api
@@ -166,5 +174,5 @@ class SystemServerClient(RpcClient):
     pass
 
   @rpc_api
-  def mock_battery_info(self, on: bool) -> void:
+  def stability_test(self, count: int) -> void:
     pass

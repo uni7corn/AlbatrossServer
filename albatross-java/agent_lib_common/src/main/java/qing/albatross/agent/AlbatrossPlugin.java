@@ -29,6 +29,10 @@ public abstract class AlbatrossPlugin {
   protected boolean enable;
 
 
+  boolean hasFlags(int flags) {
+    return (this.flags & flags) != 0;
+  }
+
   public AlbatrossPlugin(String libName, String params, int flags) {
     this.params = params;
     this.flags = flags;
@@ -58,15 +62,72 @@ public abstract class AlbatrossPlugin {
     }
   }
 
+  public boolean beforeApplicationCreateCall;
+
+  public final boolean beforeApplicationCreateCall(Application application) {
+    if (!beforeApplicationCreateCall) {
+      beforeApplicationCreateCall = true;
+      Albatross.log("call plugin " + pluginName() + " beforeApplicationCreate");
+      try {
+        beforeApplicationCreate(application);
+      } catch (Exception e) {
+        Albatross.log("call plugin " + pluginName() + " beforeApplicationCreate err", e);
+      }
+      return true;
+    } else {
+      Albatross.log("skip call plugin " + pluginName() + " beforeApplicationCreate");
+      return false;
+    }
+  }
+
   public void beforeApplicationCreate(Application application) {
   }
 
+  public boolean beforeMakeApplicationCall;
 
   public void beforeMakeApplication() {
   }
 
+  public boolean beforeNewApplicationCall;
+
+  public final synchronized boolean beforeNewApplicationCall(ClassLoader cl, String className, Context context) {
+    if (!beforeNewApplicationCall) {
+      beforeNewApplicationCall = true;
+      Albatross.log("call plugin " + pluginName() + " beforeNewApplication");
+      try {
+        beforeNewApplication(cl, className, context);
+      } catch (Exception e) {
+        Albatross.log("call plugin " + pluginName() + " beforeNewApplication err", e);
+      }
+      return true;
+    } else {
+      Albatross.log("skip call plugin " + pluginName() + " beforeNewApplication");
+    }
+    return false;
+  }
+
   public void beforeNewApplication(ClassLoader cl, String className, Context context) {
 
+  }
+
+  public boolean afterNewApplicationCall;
+
+  public final boolean afterNewApplicationCall(Application application) {
+    synchronized (this) {
+      if (!afterNewApplicationCall) {
+        afterNewApplicationCall = true;
+      } else {
+        Albatross.log("skip call plugin " + pluginName() + " afterNewApplication");
+        return false;
+      }
+    }
+    Albatross.log("call plugin " + pluginName() + " afterNewApplication");
+    try {
+      afterNewApplication(application);
+    } catch (Exception e) {
+      Albatross.log("call plugin " + pluginName() + " afterNewApplication err", e);
+    }
+    return true;
   }
 
   public void afterNewApplication(Application application) {
@@ -106,6 +167,24 @@ public abstract class AlbatrossPlugin {
     return this.enable;
   }
 
+
+  public boolean afterApplicationCreateCall;
+
+  public final synchronized boolean afterApplicationCreateCall(Application application) {
+    if (!afterApplicationCreateCall) {
+      afterApplicationCreateCall = true;
+      Albatross.log("call plugin " + pluginName() + " afterApplicationCreate");
+      try {
+        afterApplicationCreate(application);
+      } catch (Exception e) {
+        Albatross.log("call plugin " + pluginName() + " afterApplicationCreate err", e);
+      }
+      return true;
+    } else {
+      Albatross.log("skip call plugin " + pluginName() + " afterApplicationCreate");
+    }
+    return false;
+  }
 
   public void afterApplicationCreate(Application application) {
   }
