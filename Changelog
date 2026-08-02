@@ -1,3 +1,15 @@
+version 3.5.0
+- Add class hook APIs: hook_class / unhook_class with static, instance and constructor scope, and a safe tostring option.
+- Add native library monitoring APIs: get modules / functions, watch function, watch library load, dump native method and the onLibLoad callback.
+- Add read_file / read_maps / read_smaps and set_to_string_config for configuring the SafeToString output.
+- Add dump_all_threads for dumping all java threads of the target app.
+- System server: add stability_test, clear_uid, set_intercept_all and set_app_android_id.
+- Add mount / umount, launch mount / umount and hide_path; add set_dex_load_timeout.
+- Send app package name and version when adding rules automatically; add set_app_info / get_app_info.
+- Save crash logs to local files when the app process crashes.
+- Optimize the interception of system applications: support Android 13+ PidMap and registerReceiver hooks, and the Xiaomi attachApplicationLocked variant.
+- Report the specific failure reason (dex load result) when loading a plugin.
+
 version 3.4.0
 - Add the API for granting permissions.
 - Optimize the interception of system applications.
