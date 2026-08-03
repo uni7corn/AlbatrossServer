@@ -201,7 +201,7 @@ resume_activity_pattern = re.compile(r"mResumedActivity: ActivityRecord{\w+\s\w+
 
 
 class AlbatrossDevice(object):
-  anti_detection = True
+  anti_detection = False
   auto_subscribe_system_server = True
 
   ret_code: int
@@ -886,7 +886,7 @@ class AlbatrossDevice(object):
               kpm = client.support_extend_kpm()
             except:
               pass
-        if self.sdk_version >= 29 and not kpm:
+        if self.sdk_version >= 29 and not kpm and os.path.exists(self.copy_script):
           owner = 'root'
           lib_file_type = 'system_lib_file'
           jar_file_type = 'system_file'
@@ -1764,7 +1764,7 @@ class AlbatrossDevice(object):
           return False
         else:
           self.uninstall_package(package)
-    if self.brand in [DeviceBrand.RealMe, DeviceBrand.OnePlus]:
+    if self.brand in [DeviceBrand.RealMe, DeviceBrand.OnePlus, DeviceBrand.OPPO]:
       self.silence_install(apk)
     else:
       res = self.adb_cmd('install -r -d -t ' + apk)
